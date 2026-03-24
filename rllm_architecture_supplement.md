@@ -424,6 +424,470 @@ rLLM 当前**不原生支持 offline RL**（从离线数据训练）。框架设
 
 ---
 
+## 🟢 11. Examples 目录完整解析
+
+> `examples/` 包含 20 个子项目，覆盖了从简单数学推理到 SWE-Bench 编程代理的全部场景。按**实现模式**分类如下：
+
+### 11.1 模式全景图
+
+| 模式 | 示例 | 核心组件 | 训练后端 |
+|------|------|----------|----------|
+| **单轮数学推理** | `simple_math`, `gsm8k_lora`, `deepscaler`, `countdown` | `MathAgent` + `SingleTurnEnv` | verl |
+| **多步工具调用** | `math_tool`, `search`, `deepcoder` | `ToolAgent` + `ToolEnvironment` | verl |
+| **环境交互 Agent** | `frozenlake` | `FrozenLakeAgent` + `FrozenLakeEnv` | verl |
+| **多 Agent 协作** | `solver_judge`, `solver_judge_tinker`, `solver_judge_modal` | `SolverJudgeWorkflow` | verl / tinker |
+| **第三方环境集成** | `verifiers_env`, `eval_protocol` | `VerifiersWorkflow` / `EvalProtocolWorkflow` | verl / tinker |
+| **SWE 编程代理** | `swe` | `SWEEnv` + R2E-Gym | verl (K8s) |
+| **Distillation** | `math_distill` | `DistillationWorkflow` | tinker |
+| **完全异步训练** | `fully_async/deepresearch` | `AsyncAgentTrainer` + 自定义 `rollout_fn` | verl (experimental) |
+| **SDK 模式** | `sdk` | LiteLLM Proxy + `SimpleWorkflow`/`SolverJudgeWorkflow` | verl |
+
+---
+
+### 11.2 单轮数学推理（最简模式）
+
+**代表项目**：`simple_math`, `gsm8k_lora`, `deepscaler`, `countdown`
+
+最小训练脚本结构（以 `gsm8k_lora` 为例）：
+
+```python
+# examples/gsm8k_lora/train_gsm8k_with_lora.py
+@hydra.main(config_name="agent_ppo_trainer")
+def main(config):
+    train_dataset = DatasetRegistry.load_dataset("gsm8k", "train")
+    test_dataset  = DatasetRegistry.load_dataset("gsm8k", "test")
+
+    trainer = AgentTrainer(
+        agent_class=MathAgent,
+        env_class=SingleTurnEnvironment,
+        env_args={"reward_fn": math_reward_fn},
+        config=config,
+        train_dataset=train_dataset,
+        val_dataset=test_dataset,
+    )
+    trainer.train()
+```
+
+**关键点**：
+- `SingleTurnEnvironment`：单步环境，`step()` 直接调用 `reward_fn` 评分，无需多轮交互
+- `MathAgent`：内置 `\boxed{}` 格式解析逻辑
+- **LoRA 支持**：在 YAML config 中设置 `actor_rollout_ref.model.lora_rank=32` 即可启用 LoRA
+
+**DeepScaler 的迭代上下文增长**：
+
+```bash
+# 三阶段迭代训练，上下文从 8K 逐步扩展到 24K
+bash examples/deepscaler/train_deepscaler_8k.sh   # 阶段 1
+bash examples/deepscaler/train_deepscaler_16k.sh  # 阶段 2，需传入上一阶段 ckpt
+bash examples/deepscaler/train_deepscaler_24k.sh  # 阶段 3
+```
+
+> **设计意图**：Iterative Context Lengthening (ICL)——先训练短上下文，再用 checkpoint 继续扩展，比直接训练长上下文更稳定。同样应用于 `deepcoder`（16K→32K→64K）。
+
+---
+
+### 11.3 多步工具调用 Agent
+
+**代表项目**：`math_tool`, `search`, `deepcoder`
+
+#### ToolAgent + ToolEnvironment 模式
+
+```python
+# examples/search/run_search_agent.py
+tool_map = {"local_search": LocalRetrievalTool}  # 工具名 → 工具类
+
+engine = AgentExecutionEngine(
+    agent_class=ToolAgent,
+    agent_args={"tool_map": tool_map, "system_prompt": SEARCH_SYSTEM_PROMPT, "parser_name": "qwen"},
+    env_class=ToolEnvironment,
+    env_args={"tool_map": tool_map, "reward_fn": search_reward_fn},
+    ...
+)
+```
+
+**ToolEnvironment 工作机制**：
+1. Agent 生成包含 `<tool_call>...</tool_call>` XML 标签的响应
+2. `ToolEnvironment.step()` 解析工具调用，执行 `tool_map[tool_name](**args)`
+3. 工具结果作为新观察返回给 Agent
+4. 最终轮次（无工具调用或达到 `max_steps`）计算奖励
+
+**Search Agent 架构**：
+```
+HotpotQA 问题 → ToolAgent (qwen parser)
+    → 发出 <tool_call>local_search</tool_call>
+    → LocalRetrievalTool (E5 密集检索 Wikipedia)
+    → 检索结果作为观察返回
+    → 迭代直到得出最终答案
+    → search_reward_fn 计算 F1/EM 奖励
+```
+
+**更换 parser 支持不同模型**：`parser_name` 控制工具调用格式解析，`"qwen"` 对应 Qwen3 的工具调用格式。
+
+---
+
+### 11.4 经典 RL 环境交互（FrozenLake）
+
+**代表项目**：`frozenlake`
+
+这是 rLLM 框架的**教学示例**，展示如何将经典 RL 环境接入 LLM 训练：
+
+```python
+# examples/frozenlake/run_frozenlake_agent.py
+engine = AgentExecutionEngine(
+    agent_class=FrozenLakeAgent,
+    env_class=FrozenLakeEnv,
+    agent_args={"max_steps": 10, "use_accumulate_history": True},
+    env_args={"max_steps": 8, "is_slippery": False},
+    ...
+    n_parallel_agents=256,  # 256 并发 agent 同时运行
+)
+```
+
+**数据集生成策略**：
+```python
+# prepare_frozenlake_data.py
+# 随机生成 10,000 个训练环境 + 100 个测试环境
+# 每个环境参数随机化：size(2-10), slip_prob(0.6-0.85), seed
+```
+
+**`FrozenLakeAgent` 的 `use_accumulate_history`**：为 True 时将完整历史（包含所有步骤的观察和动作）传给 LLM，为 False 时只传当前状态，This 控制是否使用 in-context learning 进行多步推理。
+
+训练配置使用 `rllm/experimental/common/rl_algo.py` 的 GRPO 算法，在同一 FrozenLake 地图的 4 次 rollout 之间做组内优势归一化。
+
+---
+
+### 11.5 自定义 Agent 完整实现（MathAgentWithFewshot）
+
+**代表项目**：`math_tinker`
+
+`MathAgentWithFewshot` 是 [`BaseAgent`](file:///home/robomaster/Research/rllm/rllm/agents/agent.py) 的完整自定义实现，展示了所有关键接口的使用：
+
+```python
+# examples/math_tinker/math_agent_with_fewshot.py
+class MathAgentWithFewshot(BaseAgent):
+    STANDARD_FEWSHOT_PREFIX = [...]  # 标准 few-shot 示例，reset() 后保留
+
+    def reset(self):
+        self._trajectory = Trajectory()
+        self.messages = []
+        if self.use_fewshot:
+            self.messages.extend(copy.deepcopy(self.STANDARD_FEWSHOT_PREFIX))  # 注意 deepcopy！
+
+    def update_from_env(self, observation, reward, done, info, **kwargs):
+        # 区分两种情况：
+        # 1. observation=None → 只更新当前 step 的 reward/done
+        # 2. observation=非None → 创建新 step，添加到 trajectory
+        if observation is None:
+            self.get_current_state().reward = reward
+            return
+        self.messages.append({"role": "user", "content": formatted_obs})
+        self._trajectory.steps.append(Step(observation=formatted_obs))
+
+    def update_from_model(self, response: str, **kwargs) -> Action:
+        self.messages.append({"role": "assistant", "content": response})
+        # 解析 <think>...</think> 思维链
+        if "</think>" in response:
+            thought, _, action_str = response.partition("</think>")
+        cur_step.thought = thought
+        cur_step.chat_completions = self.chat_completions
+        return Action(response.strip())
+
+    @property
+    def chat_completions(self) -> list[dict]:
+        # 可选：不积累历史中的 <think> 部分以减少上下文
+        if not self.accumulate_thinking:
+            # 清除历史 assistant 消息的 <think> 部分
+            ...
+        return messages
+```
+
+**关键细节**：
+- `reset()` 保留了 few-shot 前缀——这是 multi-episode 训练中的常见需求
+- `chat_completions` 可以过滤掉历史中的 `<think>` 标签，减少上下文长度
+- `update_from_env` 区分"纯奖励更新"和"新观察"两种情形
+
+---
+
+### 11.6 多 Agent 协作：Solver-Judge 实战
+
+**代表项目**：`solver_judge`, `solver_judge_tinker`, `solver_judge_modal`
+
+#### 完整 Workflow 实现
+
+```python
+# examples/solver_judge/solver_judge_flow.py
+class SolverJudgeWorkflow(Workflow):
+    def __init__(self, rollout_engine, n_solutions=2, reward_function=None, **kwargs):
+        super().__init__(rollout_engine, **kwargs)
+        self.solver = Solver(rollout_engine)  # 使用同一个 rollout_engine
+        self.judge  = Judge(rollout_engine)   # Solver 和 Judge 共享 LLM
+
+    async def run(self, task: dict, uid: str) -> Episode:
+        problem = task["question"]
+
+        # Step 1: Solver 并行生成 N 个方案
+        solver_trajectories = await self.solver.generate_solutions(problem, self.n_solutions)
+
+        # Step 2: 逐个评分
+        for traj in solver_trajectories:
+            traj.steps[0].reward = self.reward_function(task, traj.steps[0].action).reward
+
+        # Step 3: Judge 选最佳方案
+        judge_traj = await self.judge.judge_solutions(problem, solutions)
+        judge_traj.steps[0].reward = self.reward_function(task, selected_solution).reward
+
+        # Step 4: 返回包含所有角色轨迹的 Episode
+        return Episode(
+            id=uid,
+            task=task,
+            trajectories=[*solver_trajectories, judge_traj],  # 角色通过 trajectory.name 区分
+            is_correct=is_correct,
+            metrics={"solver_acc": ..., "judge_acc": ...},
+        )
+```
+
+#### 三种部署变体对比
+
+| 变体 | 路径 | 特点 |
+|------|------|------|
+| **verl** | `solver_judge/` | 本地 GPU 分布式训练，支持 CoUntdown 类比 |
+| **tinker** | `solver_judge_tinker/` | 远端推理，LoRA 微调，单机即可运行 |
+| **modal** | `solver_judge_modal/` | 云端 Modal 部署，`modal_deploy.py` 管理 GPU 资源 |
+
+**奖励分配策略**：solver 和 judge 轨迹分别使用独立的 `traj_group_adv_estimator_map` 配置，可以为每个角色选择不同的优势估计算法（如 solver 用 GRPO，judge 用 REINFORCE）。
+
+---
+
+### 11.7 第三方环境集成
+
+#### 11.7.1 Verifiers 环境
+
+**代表项目**：`verifiers_env`
+
+核心：`VerifiersWorkflow` 将 rLLM 的 `RolloutEngine` 包装为 `AsyncOpenAI` 兼容接口供 Verifiers 使用。
+
+```python
+# examples/verifiers_env/workflow.py
+class VerifiersWorkflow(Workflow):
+    async def run(self, task, uid) -> Episode:
+        # 1. 将 rLLM RolloutEngine 包装为 AsyncOpenAI 客户端
+        client = RolloutEngineAsyncClient(rollout_engine=self.rollout_engine, ...)
+
+        # 2. 执行 Verifiers 环境的 rollout
+        state = await self.vf_env.rollout(input=rollout_input, client=client, ...)
+        await self.vf_env.rubric.score_rollout(state, ...)
+
+        # 3. 将 Verifiers State → rLLM Episode
+        return self._convert_state_to_episode(state, uid)
+
+    def _convert_state_to_episode(self, state, uid) -> Episode:
+        # Verifiers 的 TrajectoryStep 包含 tokens: {prompt_ids, completion_ids, completion_logprobs}
+        # 直接映射到 rLLM Step 的 prompt_ids / response_ids / logprobs
+        steps = [Step(
+            prompt_ids=traj_step["tokens"]["prompt_ids"],
+            response_ids=traj_step["tokens"]["completion_ids"],
+            logprobs=traj_step["tokens"]["completion_logprobs"],
+            reward=traj_step.get("reward", 0.0),
+        ) for traj_step in state["trajectory"]]
+        ...
+```
+
+**架构图**：
+```
+AgentTrainer
+    └─ VerifiersWorkflow.run()
+           └─ RolloutEngineAsyncClient  ← 适配器层
+                   └─ RolloutEngine     ← rLLM 推理引擎
+           └─ vf_env.rollout()          ← Verifiers 管理对话轮次
+           └─ vf_env.rubric.score()     ← Verifiers rubric 评分
+```
+
+#### 11.7.2 Eval Protocol 环境
+
+**代表项目**：`eval_protocol`
+
+`EvalProtocolWorkflow` 通过 MCP（Model Context Protocol）Server 接入 Eval Protocol 基准。特点：
+- 使用 Fireworks AI 作为推理后端（非本地 vLLM）
+- 支持 FrozenLake、WebArena、AppWorld 等标准 benchmark
+
+```bash
+# 推理
+python examples/eval_protocol/run_frozen_lake_flow.py
+
+# 训练
+bash examples/eval_protocol/train_frozen_lake_flow.sh
+```
+
+---
+
+### 11.8 SWE-Bench 编程代理（DeepSWE）
+
+**代表项目**：`swe`
+
+**成果**：DeepSWE-Preview 在 SWE-Bench-Verified 上达到 **59.2% Pass@16, 42.2% Pass@1**（开源 SOTA）。
+
+**技术栈**：
+```
+rLLM + R2E-Gym + Kubernetes + Docker
+  ├── 模型：Qwen3-32B（初始化）
+  ├── 环境：R2E-Gym SWE-Bench Docker 容器（1000 个并行）
+  ├── 基础设施：AWS/GCP K8s 集群（64+ GPUs，200 CPU/node, 6TB+ 磁盘）
+  └── 规模：512 个并行 Docker 容器
+```
+
+**`SWEEnv` 使用方式**（见 [`rllm/environments/swe/swe.py`](file:///home/robomaster/Research/rllm/rllm/environments/swe/swe.py)）：
+
+```python
+from rllm.environments.swe.swe import SWEEnv
+from datasets import load_dataset
+
+ds = load_dataset("R2E-Gym/R2E-Gym-Subset", split="train")
+env = SWEEnv(entry=ds[0], backend='kubernetes', scaffold='r2egym')
+env.reset()   # 启动容器
+env.step(patch_content)  # 提交代码修改
+env.close()  # 销毁容器
+```
+
+**训练脚本**（需要 K8s 集群）：
+```bash
+bash examples/swe/train_deepswe_32b.sh
+```
+
+---
+
+### 11.9 On-Policy Distillation（`math_distill`）
+
+**代表项目**：`math_distill`
+
+**核心思想**：用学生模型采样轨迹，用教师模型的 log-prob 计算 per-token 优势，而非稀疏的 RL 奖励。
+
+```
+advantage[t] = log P_teacher(token_t) - log P_student(token_t)
+```
+
+**配置关键参数**：
+
+```bash
+python -m examples.math_distill.train_deepmath_distill_tinker \
+    rllm/backend=tinker \
+    model.name=Qwen/Qwen3-8B-Base \
+    model.lora_rank=128 \
+    rllm.algorithm.use_precomputed_advantage=true  # 跳过 RL 优势计算，直接用 workflow 计算的 advantage
+    rllm.algorithm.loss_fn=importance_sampling \
+    training.group_size=4
+```
+
+**流程**：
+1. `DistillationWorkflow.run()` 采样学生轨迹，调用教师模型计算 `clip(-5, advantage, +5)`
+2. `use_precomputed_advantage=true` → 框架跳过 GRPO/REINFORCE，直接使用 trajectory 中存储的 advantage
+3. 教师模型（Qwen3-32B）通过 Tinker API 调用，学生（Qwen3-8B）本地 LoRA 训练
+
+> **OPD vs RL**：OPD 拥有 dense per-token feedback（每个 token 都有梯度信号），RL 只有 sparse trajectory-level reward。OPD 一般收敛更快但依赖教师模型质量。
+
+---
+
+### 11.10 完全异步训练（`fully_async/deepresearch`）
+
+**代表项目**：`fully_async/deepresearch`
+
+使用实验性的 `AsyncAgentTrainer`，rollout 生成与模型训练完全并行（类 IMPALA 架构）。
+
+```python
+# examples/fully_async/deepresearch/train.py
+@hydra.main(config_name="fully_async_ppo_trainer")
+def main(config):
+    trainer = AsyncAgentTrainer(
+        config=config,
+        rollout_fn=rollout_fn,      # 自定义 async rollout 函数
+        val_rollout_fn=val_rollout_fn,
+    )
+    trainer.train()
+
+async def rollout_fn(client, tokenizer, **kwargs):
+    reward, metric = await rollout(client=client, tool=train_retriever_tool, **kwargs)
+    trajectory = metric.pop("trajectory")
+    trajectory.reward = reward
+    
+    # 追踪 staleness（推理使用的权重版本）
+    trajectory.metadata = {
+        "param_version_start": client.cur_version,
+        "is_partial": param_version_start != param_version_end,  # 是否使用了过期权重
+        "tool_calls_time": tool_calls_count,
+    }
+    return trajectory
+```
+
+**与标准 `AgentTrainer` 的区别**：
+
+| 特性 | `AgentTrainer` | `AsyncAgentTrainer` |
+|------|--------------|---------------------|
+| rollout/train 关系 | 串行（collect → train） | 完全并行（IMPALA 风格） |
+| 权重 staleness | 无 | 有，需要 off-policy 校正 |
+| 自定义 rollout | 通过 Workflow 类 | 直接传 `rollout_fn` 函数 |
+| 适用场景 | 大多数 RL 场景 | 超长 rollout（深度研究型 Agent） |
+
+**DeepResearch Agent**：多步 RAG 搜索（E5 检索 Wikipedia），每次 rollout 可能包含数十次工具调用，完全异步以最大化 GPU 利用率。
+
+---
+
+### 11.11 SDK 模式（`sdk`）
+
+**代表项目**：`sdk`
+
+SDK 模式通过 **LiteLLM Proxy** 将外部 LLM 服务（如 cloud API）接入 rLLM 训练框架，不依赖本地 GPU 推理。
+
+```
+AgentTrainer
+    └─ rllm.sdk.proxy (LiteLLM Proxy Server)
+           ├─ 自动管理 Proxy 生命周期（subprocess 模式）
+           └─ 路由到外部 LLM API（OpenAI, Anthropic, vLLM, etc.）
+```
+
+**启动方式**：
+```bash
+# Proxy 自动管理（推荐）
+# 训练脚本中设置: rllm.sdk.proxy.mode=subprocess
+
+# 手动管理
+python -m rllm.sdk.proxy.litellm_server \
+  --config litellm_proxy_config_autogen.yaml \
+  --port 4000 \
+  --cs-endpoint http://localhost:8000
+```
+
+SDK 目录内还包含 `tutorial_quickstart.ipynb` 和 `sdk/simple_math/`, `sdk/solver_judge/` 两个完整示例，适合快速上手。
+
+---
+
+### 11.12 Examples 目录结构速查
+
+```
+examples/
+├── simple_math/          # 最简单：MathAgent + SingleTurnEnv
+├── gsm8k_lora/           # LoRA 微调示例
+├── countdown/            # 数学倒计时：自定义 Dataset + 标准训练
+├── deepscaler/           # DeepScaleR：ICL (8K→16K→24K)
+├── deepcoder/            # DeepCoder：代码推理，ICL (16K→32K→64K)
+├── math_tool/            # 工具调用：Python 解释器工具
+├── search/               # 搜索 Agent：E5 检索 + HotpotQA
+├── frozenlake/           # 经典 RL 环境：多步导航
+├── math_tinker/          # Tinker 后端 + 自定义 Agent + few-shot
+├── math_distill/         # On-Policy Distillation
+├── geo3k/                # VLM 训练：几何视觉推理
+├── solver_judge/         # 多 Agent：verl 后端
+├── solver_judge_tinker/  # 多 Agent：tinker 后端
+├── solver_judge_modal/   # 多 Agent：Modal 云部署
+├── swe/                  # SWE-Bench：DeepSWE-Preview
+├── verifiers_env/        # 第三方 Verifiers 环境集成
+├── eval_protocol/        # Eval Protocol + MCP Server 集成
+├── fully_async/          # 完全异步训练（experimental）
+│   └── deepresearch/     # 深度研究型 Agent
+├── sdk/                  # SDK 模式：LiteLLM Proxy
+└── archive/              # 旧版示例存档
+```
+
+---
+
 ## 📋 Review 疑问解决状态
 
 | # | 疑问 | 状态 | 关键源文件 |
