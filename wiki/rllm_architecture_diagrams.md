@@ -458,13 +458,13 @@ sequenceDiagram
     participant DS as Dataset
     participant AT as AgentTrainer
     participant Ray as Ray Cluster
-    participant TaskRunner as TaskRunner (Ray Actor)
+    participant TaskRunner as TaskRunner
     participant Engine as Execution Engine
     participant RE as RolloutEngine
-    participant Transform as transform_results_for_verl()
-    participant Actor as Actor (FSDP)
+    participant Transform as Transform Layer
+    participant IActor as Actor FSDP
     participant Ref as Ref Model
-    participant Critic as Critic (FSDP)
+    participant Critic as Critic FSDP
     participant Adv as Advantage Estimator
 
     DS->>AT: train_dataset, val_dataset
@@ -473,29 +473,29 @@ sequenceDiagram
 
     loop Training Iteration
         TaskRunner->>DS: batch = next(dataloader)
-        Note right of DS: DataProto{non_tensor: task_dicts, task_ids}
+        Note right of DS: DataProto with task_dicts and task_ids
 
         TaskRunner->>Engine: execute_tasks_verl(batch)
 
         rect rgb(215, 230, 250)
-            Note over RE: ★ INFERENCE PHASE (GPU: vLLM)
-            Engine->>RE: wake_up() [load weights + KV cache]
+            Note over RE: [INFERENCE PHASE] GPU: vLLM
+            Engine->>RE: wake_up() - load weights and KV cache
             Engine->>Engine: run N agent-env loops in parallel
-            Engine->>RE: sleep() [release GPU memory]
+            Engine->>RE: sleep() - release GPU memory
         end
 
-        Engine->>Transform: list[Episode]
-        Transform->>Transform: tokenize → pad → mask
-        Transform-->>TaskRunner: DataProto{input_ids, attention_mask, response_mask, rewards}
+        Engine->>Transform: list of Episodes
+        Transform->>Transform: tokenize, pad, mask
+        Transform-->>TaskRunner: DataProto with input_ids, attention_mask, response_mask, rewards
 
         rect rgb(255, 225, 225)
-            Note over Actor: ★ TRAINING PHASE (GPU: FSDP)
+            Note over IActor: [TRAINING PHASE] GPU FSDP
             TaskRunner->>Ref: ref_log_probs = ref.forward(input_ids)
-            TaskRunner->>Actor: actor_log_probs = actor.forward(input_ids)
+            TaskRunner->>IActor: actor_log_probs = actor.forward(input_ids)
             TaskRunner->>Critic: values = critic.forward(input_ids)
             TaskRunner->>Adv: advantages = compute(rewards, values)
             Note right of Adv: GRPO: group_normalize(rewards)<br/>REINFORCE: rewards - baseline<br/>RLOO: leave_one_out(rewards)
-            TaskRunner->>Actor: PPO update: clip(ratio * advantages)
+            TaskRunner->>IActor: PPO update: clip(ratio * advantages)
             TaskRunner->>Critic: value loss update
         end
 
