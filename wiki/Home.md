@@ -81,3 +81,4 @@ rLLM（Reinforcement Learning for Language Models）框架技术文档。
 | [蒸馏系统](33-Distillation-System.md) | On-policy 蒸馏 |
 | [Trace 收集与调试](34-Trace-Collection-and-Debugging.md) | 日志、监控、排错 |
 | [测试基础设施](35-Testing-Infrastructure.md) | pytest 测试用例 |
+| [_transform_agent_trajectories 详解](36-AgentPPOTrainer-Transform-Agent-Trajectories.md) | 轨迹→DataProto 转换流程 |
