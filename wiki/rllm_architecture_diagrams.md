@@ -1210,3 +1210,63 @@ graph LR
 | `is_pad_step` | `[B]` (non-tensor) | 是否为填充 step（对齐 world_size） |
 | `idxs` | `[B]` (non-tensor) | 对应原始 batch 的任务索引 |
 | `repeat_counts` | `list[int]` (meta) | 每个 episode 展开的步数 |
+
+---
+
+## 15. `hybrid_engine` 配置项详解
+
+### 15.1 含义
+
+`actor_rollout_ref.hybrid_engine` 控制 **Actor（训练）与 Rollout（推理）是否共用同一个 Worker Group**。
+
+```yaml
+actor_rollout_ref:
+  hybrid_engine: true   # 默认值，rllm 标准模式
+```
+
+| 值 | 说明 |
+|----|------|
+| `true`（混合引擎） | Actor 和 Rollout **合并**在同一个 `actor_rollout_wg` 中，共享 GPU 进程与显存 |
+| `false`（分离引擎） | Actor 和 Rollout 分别运行在独立的 `actor_wg` + `rollout_wg` 中 |
+
+### 15.2 各 Trainer 的强制约束
+
+| Trainer | 强制要求 | 原因 |
+|---------|---------|------|
+| `AgentPPOTrainer` | 必须为 `true` | 依赖异步 Rollout，需混合引擎支持 |
+| `AgentWorkflowTrainer` | 必须为 `true` | 同上 |
+| `AgentPPOTrainerPipeline` | 必须为 `false` | Pipeline 模式下 Rollout 与 Actor 位于不同 Worker Group |
+| `FullyAsyncTrainer` | 必须为 `false` | 全异步架构不支持混合引擎 |
+
+代码位置：
+
+```python
+# agent_ppo_trainer.py L54
+assert self.config.actor_rollout_ref.hybrid_engine, "Only hybrid engine is supported"
+
+# agent_ppo_trainer_pipeline.py L23
+assert not self.hybrid_engine, "PPO pipeline trainer does not support hybrid engine..."
+```
+
+### 15.3 对 Batch Padding 的影响
+
+`_pad_dataproto_to_world_size` 根据此标志决定取哪个 Worker Group 的 `world_size` 计算对齐基数：
+
+```python
+if self.hybrid_engine:
+    world_sizes.append(self.actor_rollout_wg.world_size)   # 合并的 wg
+else:
+    world_sizes.append(self.actor_wg.world_size)
+    world_sizes.append(self.rollout_wg.world_size)
+```
+
+### 15.4 工程权衡
+
+| 维度 | `hybrid_engine=true` | `hybrid_engine=false` |
+|------|---------------------|----------------------|
+| **GPU 利用** | 推理/训练共享显存，无权重传输 | 独立显存，需跨节点同步权重 |
+| **延迟** | 低（同进程内切换） | 高（网络传输权重） |
+| **规模** | 适合单机多 GPU | 适合超大规模流水线并行 |
+| **rllm 支持** | ✅ 默认推荐 | 仅 Pipeline/FullyAsync 模式 |
+
+> **结论**：rllm 的标准训练路径（`AgentPPOTrainer`）强制 `hybrid_engine=true`，即 Actor 训练与 Rollout 推理复用同一组 GPU Worker，无需跨节点传输权重，是 GPU 时间共享机制的基础。
