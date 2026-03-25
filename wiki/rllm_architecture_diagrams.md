@@ -873,3 +873,340 @@ graph LR
 | **Agent** | 状态持有者，响应解析器 | **必须继承定制** |
 | **Env** | 奖励来源，任务状态机 | **必须继承定制** |
 | **RolloutEngine** | LLM 推理抽象层 | 按 backend 选择，无需直接修改 |
+
+---
+
+## 10. AgentPPOTrainer 训练主循环详解
+
+`AgentPPOTrainer` 继承自 verl 的 `RayPPOTrainer`，在 `fit_agent()` 中实现了完整的 Agentic RL 训练循环。
+
+### 10.1 训练循环全貌
+
+```mermaid
+flowchart TD
+    A([开始]) --> B[加载 checkpoint\n_load_checkpoint]
+    B --> C{val_before_train?}
+    C --是--> D[_validate_agent\n计算初始 val 指标]
+    C --否--> E
+    D --> E[global_steps = 1]
+
+    E --> F[["for epoch in epochs\nfor batch in dataloader"]]
+    F --> G["DataProto = from_single_dict(batch_dict)\n分配 uid\nbatch.repeat(rollout.n, interleave=True)\n弹出 input_ids / attention_mask / position_ids"]
+
+    G --> H[init_envs_and_agents\n并行创建 Env×N, Agent×N]
+
+    H --> I{stepwise_advantage\n.enable?}
+
+    I --False--> J["generate_agent_trajectory()\nmode='Token'\n每条 traj → 单条 token 序列"]
+    I --True--> K["generate_agent_steps()\nmode='Step'\n每步 → 独立训练行"]
+
+    J --> L["_transform_agent_trajectories()\n见 §11.1"]
+    K --> M["_transform_agent_steps()\n见 §11.2"]
+
+    L --> N[batch.union DataProto]
+    M --> N
+
+    N --> O{use_critic?}
+    O --是--> P["critic_wg.compute_values(batch)\n→ batch['values']"]
+    O --否--> Q
+
+    P --> Q["rejection_sample + advantage\n见 §12"]
+
+    Q --> R{use_critic?}
+    R --是--> S["critic_wg.update_critic(batch)\n梯度步: 价值网络"]
+    R --否--> T
+
+    S --> T{critic_warmup\n已过?}
+    T --是--> U["actor_rollout_wg.update_actor(batch)\n梯度步: PPO clip 策略更新"]
+    T --否--> V
+
+    U --> V{test_freq\n命中?}
+    V --是--> W[_validate_agent]
+    V --否--> X
+
+    W --> X{save_freq\n命中?}
+    X --是--> Y[_save_checkpoint]
+    X --否--> Z
+
+    Y --> Z[global_steps++\nlog metrics]
+    Z --> ZZ{达到\ntotal_training_steps?}
+    ZZ --否--> F
+    ZZ --是--> END([结束])
+```
+
+### 10.2 关键配置与对应行为
+
+| 配置键 | 说明 | 影响 |
+|--------|------|------|
+| `rllm.stepwise_advantage.enable` | 是否逐步优势 | 决定 `generate_agent_trajectory` vs `generate_agent_steps` |
+| `rllm.stepwise_advantage.mode` | `broadcast` / `per_step` | 影响 advantage 归一化分组 |
+| `rllm.rejection_sample.enable` | 是否启用拒绝采样 | 过滤全对/全错 episode 组 |
+| `rllm.agent.overlong_filter` | 超长过滤 | 截断/超时样本的 response_mask 全零化 |
+| `rllm.mask_truncated_samples` | 截断样本掩码 | 过滤最后 token 仍有效的样本（未正常结束）|
+| `actor_rollout_ref.rollout.n` | 每题 rollout 数 | 每条 task 生成 n 条轨迹，用于 GRPO 分组 |
+| `trainer.critic_warmup` | Critic 预热步数 | 前 N 步只更新 Critic，稳定基线 |
+
+---
+
+## 11. 轨迹转换双路径详解
+
+执行引擎按 `stepwise_advantage.enable` 走两条不同的转换路径，将原始交互数据打包为训练张量。
+
+### 11.1 _transform_agent_trajectories（默认路径）
+
+适用于 `stepwise_advantage.enable = False`，**每条轨迹 → 1 行 DataProto**。
+
+```mermaid
+sequenceDiagram
+    participant Engine as AgentExecutionEngine
+    participant Trans as _transform_agent_trajectories
+    participant DP as DataProto
+
+    Engine-->>Trans: list[dict]{prompt_tokens, response_tokens,\nresponse_masks, trajectory_reward,\nchat_completions, metrics}
+
+    Note over Trans: ① 提取各列表
+    Note over Trans: ② 指标聚合 → mean/min/max
+    Note over Trans: ③ 保存 chat_completions.jsonl
+
+    rect rgb(220, 235, 255)
+        Note over Trans: ④ Prompt 左填充<br/>flip → pad_sequence → flip<br/>截断: [:, -max_prompt_length:]
+    end
+
+    rect rgb(255, 225, 215)
+        Note over Trans: ⑤ Response 右填充<br/>pad_sequence<br/>截断: [:, :max_response_length]
+    end
+
+    Note over Trans: ⑥ input_ids = concat(prompts, responses)
+    Note over Trans: ⑦ attention_mask<br/>prompt_mask(右对齐) + response_mask(左对齐)
+    Note over Trans: ⑧ loss mask = response_masks 右填充
+    Note over Trans: ⑨ position_ids = cumsum(attention_mask) - 1
+    Note over Trans: ⑩ 奖励置于最后有效 response token<br/>score_batch[i, resp_len-1] = reward
+
+    Trans-->>DP: {input_ids[B,P+R], attention_mask,\nposition_ids, prompts[B,P],\nresponses[B,R], token_level_scores[B,R],\nresponse_mask[B,R]}
+```
+
+**关键设计**：
+- Prompt **左填充** 使 prompt 末尾与 response 首字节相邻，保持因果注意力连续性
+- 奖励置于最后 token 是 verl GRPO 的约定（`sum(scores, dim=-1)` 即标量奖励）
+- `response_mask` 区分 LLM 生成 token（=1）与环境/用户 token（=0），仅对前者计算 loss
+
+### 11.2 _transform_agent_steps（Stepwise 路径）
+
+适用于 `stepwise_advantage.enable = True`，**每步 → 1 行 DataProto**。
+
+```mermaid
+sequenceDiagram
+    participant Engine as AgentExecutionEngine
+    participant Trans as _transform_agent_steps
+    participant DP as DataProto
+
+    Engine-->>Trans: list[dict]{steps[{prompt,response},...],\ntrajectory_reward, mc_returns,\ntermination_reason, idx}
+
+    Note over Trans: ① 遍历每个 episode 的每个 step
+    Note over Trans: ② 逐步重新 tokenize<br/>tokenizer.encode(step["prompt"])<br/>tokenizer.encode(step["response"])
+    Note over Trans: ③ overlong_filter: 若 reason in<br/>{TRUNCATION, MAX_STEPS, TIMEOUT}<br/>→ traj_mask 全零化
+
+    rect rgb(220, 235, 255)
+        Note over Trans: ④ Prompt 左填充（同 §11.1）
+    end
+
+    rect rgb(255, 225, 215)
+        Note over Trans: ⑤ Response 右填充（同 §11.1）
+    end
+
+    Note over Trans: ⑥ attention_mask / position_ids（同 §11.1）
+    Note over Trans: ⑦ loss mask = attention_mask[:, P:] (response 部分)
+
+    rect rgb(220, 250, 220)
+        Note over Trans: ⑧ 广播 trajectory_reward 到每步最后 token<br/>score_batch[step_i, resp_len-1] = traj_reward<br/>mc_return_batch[step_i, resp_len-1] = mc_returns[step_i]
+    end
+
+    Trans-->>DP: {tensor_batch: {input_ids, attention_mask,<br/>position_ids, responses, prompts,<br/>token_level_scores, mc_returns, response_mask},<br/>non_tensor: {idxs, step_nums, is_last_step,<br/>is_pad_step, step_ids, batch_id},<br/>meta_info: {repeat_counts}}
+```
+
+**两路径对比**：
+
+| 维度 | `_transform_agent_trajectories` | `_transform_agent_steps` |
+|------|-------------------------------|--------------------------|
+| **DataProto 行粒度** | 1 trajectory → 1 行 | 1 step → 1 行 |
+| **Tokenization** | 引擎直接提供 token IDs | 重新 `tokenizer.encode()` |
+| **MC 回报** | ❌ 无 | ✅ `mc_returns[B, R]` |
+| **逐步元数据** | ❌ 无 | ✅ `is_last_step`, `step_ids`, `repeat_counts` |
+| **Overlong filter** | ❌（由引擎控制） | ✅ `response_mask` 全零化 |
+| **适用算法** | GRPO/REINFORCE（整轨迹） | Stepwise GRPO / Credit Assignment |
+
+---
+
+## 12. Rejection Sampling & Advantage 计算
+
+```mermaid
+sequenceDiagram
+    participant Batch as DataProto batch
+    participant RS as Rejection Sampling
+    participant Adv as compute_advantage()
+    participant Actor as Actor Update
+
+    Note over Batch: 获得 token_level_scores<br/>（来自环境奖励或 RM 模型）
+
+    rect rgb(255, 235, 220)
+        Note over RS: 按 uid 分组（同一任务 n 条 rollout）<br/>检测全对组 (all rewards >= 1): solve_all<br/>检测全错组 (all rewards <= 0): solve_none<br/>记录 partial 组数
+    end
+
+    alt rejection_sample.enable = True
+        RS->>Batch: 过滤 valid_mask<br/>移除 solve_all + solve_none 的行
+        Note over RS: 若过滤后 batch 为空 → skip 该批次
+        Note over RS: 向下取整至 world_size 的倍数
+    end
+
+    rect rgb(220, 240, 255)
+        Note over Batch: Actor forward: compute_log_prob<br/>→ old_log_probs, entropys
+        Note over Batch: Ref forward: compute_ref_log_prob<br/>→ ref_log_probs（KL 约束用）
+        Note over Batch: token_level_rewards = token_level_scores<br/>（注：KL penalty 以 loss 形式施加，非 reward 扣除）
+    end
+
+    alt stepwise_advantage.mode == "broadcast"
+        Note over Batch: 分离 last_step 和 other_steps<br/>仅对 last_step 计算优势
+        Batch->>Adv: compute_advantage(last_step_batch)
+        Note over Adv: GRPO: 按 uid 分组,<br/>A_i = (r_i - mean) / std<br/>REINFORCE: A = r - baseline<br/>RLOO: leave_one_out
+        Adv-->>Batch: advantages[last_step]
+        Note over Batch: _stepwise_advantage_broadcast:<br/>将 last_step 的 advantage<br/>广播回同 uid 的所有步骤
+        Note over Batch: concat(last_step + other_steps)
+    else stepwise_advantage.mode == "per_step"
+        Note over Batch: uid = step_ids（每步独立分组）<br/>token_level_rewards = mc_returns
+        Batch->>Adv: compute_advantage(全步 batch)
+        Adv-->>Batch: per-step advantages
+    else stepwise_advantage disabled
+        Batch->>Adv: compute_advantage(全 traj batch)
+        Note over Adv: 标准 GRPO/REINFORCE/RLOO
+        Adv-->>Batch: advantages[B]
+    end
+
+    Note over Actor: PPO clip update:<br/>ratio = exp(new_log_prob - old_log_prob)<br/>loss = -min(ratio*A, clip(ratio,1±ε)*A)<br/>KL penalty 直接作用于 policy loss
+```
+
+**Rejection Sampling 数值示例**（rollout.n=4）：
+
+```
+Task q1 的 4 条 rollout 奖励: [1.0, 1.0, 1.0, 1.0]  → solve_all → 丢弃
+Task q2 的 4 条 rollout 奖励: [0.0, 0.0, 0.0, 0.0]  → solve_none → 丢弃
+Task q3 的 4 条 rollout 奖励: [1.0, 0.0, 1.0, 0.0]  → partial → 保留
+Task q4 的 4 条 rollout 奖励: [0.0, 1.0, 0.0, 1.0]  → partial → 保留
+
+metrics:
+  batch/solve_none   = 1
+  batch/solve_all    = 1
+  batch/solve_partial = 2
+```
+
+> **动机**：全对组的优势标准差为 0（GRPO 归一化后梯度为 0），全错组同理。保留这些样本只会浪费显存和计算，过滤后可提高单位计算量的信息量。
+
+---
+
+## 13. Stepwise Advantage 训练集成
+
+### 13.1 broadcast 模式（推荐多步任务）
+
+```mermaid
+graph TD
+    A["每个 Episode (uid=q1)\n3 步, 2 rollouts"]
+
+    A --> B0["rollout 0:\nstep_0, step_1, step_2\ntraj_reward=0.8"]
+    A --> B1["rollout 1:\nstep_0, step_1, step_2\ntraj_reward=0.3"]
+
+    B0 --> C0["_transform_agent_steps: 3 行\nis_last_step=[F,F,T]\ntoken_level_scores: 只最后有效"]
+    B1 --> C1["_transform_agent_steps: 3 行\nis_last_step=[F,F,T]"]
+
+    C0 & C1 --> D["分离: last_steps=[r0_s2, r1_s2]\nother_steps=[r0_s0, r0_s1, r1_s0, r1_s1]"]
+
+    D --> E["compute_advantage(last_steps)\nuid=q1: A=(0.8-0.55)/σ=+X\nuid=q1: A=(0.3-0.55)/σ=-X"]
+
+    E --> F["_stepwise_advantage_broadcast:\n通过 idxs 将 A 写回同 uid 的所有步"]
+
+    F --> G["concat: 所有步都有 advantages\n→ Actor.update_actor(full_batch)"]
+```
+
+### 13.2 per_step 模式（细粒度信用分配）
+
+```mermaid
+graph TD
+    A["每个 Episode (uid=q1)\n每步独立有 step_reward"]
+
+    A --> B["_transform_agent_steps:\nmc_returns=[γ²·r2, γ·r1+γ²·r2, r1+γ·r1+γ²·r2]"]
+
+    B --> C["token_level_rewards = mc_returns\nuid = step_ids\n(q1_step0, q1_step1, q1_step2)"]
+
+    C --> D["compute_advantage(按 step_id 分组)\nstep_0: A = (mc0_r0 - mc0_r1) / σ\nstep_1: A = (mc1_r0 - mc1_r1) / σ\nstep_2: A = (mc2_r0 - mc2_r1) / σ"]
+
+    D --> E["每步使用自己的 advantage → Actor 更新"]
+```
+
+### 13.3 MC Return 计算
+
+Monte Carlo 回报在引擎层（执行轨迹后）计算，写入每步 `Step.mc_return`：
+
+```python
+# compute_mc_return(trajectory, gamma)
+# 从最后一步反向累积
+mc_return = 0.0
+for step in reversed(trajectory.steps):
+    mc_return = step.reward + gamma * mc_return
+    step.mc_return = mc_return
+```
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `gamma` | 折扣因子 | `1.0`（无折扣，适合稀疏奖励） |
+| `step.reward` | 单步奖励（通常仅最后步非零） | 由环境 `step()` 返回 |
+| `step.mc_return` | 从该步开始的期望累积回报 | 由 `compute_mc_return` 写入 |
+
+---
+
+## 14. 训练阶段完整数据形态
+
+本节汇总每个训练阶段 DataProto 中关键张量的含义与形状（`B`=batch size, `P`=max_prompt_len, `R`=max_response_len）。
+
+```mermaid
+graph LR
+    subgraph Rollout["推理阶段产出"]
+        T1["input_ids [B, P+R]"]
+        T2["attention_mask [B, P+R]"]
+        T3["position_ids [B, P+R]"]
+        T4["prompts [B, P]"]
+        T5["responses [B, R]"]
+        T6["token_level_scores [B, R]<br/>奖励仅最后有效token非零"]
+        T7["response_mask [B, R]<br/>LLM生成token=1, 环境token=0"]
+    end
+
+    subgraph Critic["Critic 阶段添加"]
+        T8["values [B, R]<br/>价值估计（GAE用）"]
+    end
+
+    subgraph LogProb["Log Prob 阶段添加"]
+        T9["old_log_probs [B, R]<br/>rollout时的token对数概率"]
+        T10["ref_log_probs [B, R]<br/>参考模型的对数概率（KL约束）"]
+        T11["token_level_rewards [B, R]<br/>= token_level_scores"]
+    end
+
+    subgraph Adv["Advantage 阶段添加"]
+        T12["advantages [B, R]<br/>GRPO/REINFORCE/RLOO归一化"]
+    end
+
+    subgraph PPO["PPO 更新使用"]
+        T13["new_log_probs [B, R]<br/>当前actor的对数概率"]
+        T14["ratio = exp(new-old) [B, R]"]
+        T15["loss = -min(ratio·A,\nclip(ratio,1±ε)·A)"]
+    end
+
+    Rollout --> Critic --> LogProb --> Adv --> PPO
+```
+
+**Stepwise 模式额外张量**（仅 `stepwise_advantage.enable=True`）：
+
+| 张量 | 形状 | 说明 |
+|------|------|------|
+| `mc_returns` | `[B, R]` | Monte Carlo 回报（最后有效token） |
+| `is_last_step` | `[B]` (non-tensor) | 该行是否为 episode 的最后一步 |
+| `step_ids` | `[B]` (non-tensor) | 步级 uid，格式 `{traj_uid}_step{i}` |
+| `is_pad_step` | `[B]` (non-tensor) | 是否为填充 step（对齐 world_size） |
+| `idxs` | `[B]` (non-tensor) | 对应原始 batch 的任务索引 |
+| `repeat_counts` | `list[int]` (meta) | 每个 episode 展开的步数 |
