@@ -169,6 +169,23 @@ class AgentPPOTrainer(RayPPOTrainer):
             pprint(f"epoch {epoch}, step {self.global_steps} started")
             for batch_dict in self.train_dataloader:
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+                '''
+                batch_dict:DataProto {
+                    batch: TensorDict{"dummy_tensor": Tensor([128,1]) }
+                    meta_info: {}
+                    non_tensor_batch: {
+                        "prompt"
+                        "reward_model"
+                        "extra_info"
+                        "raw_prompt"
+                        "index"
+                        "tool_kwargs"
+                        "interaction_kwargs"
+                        "uid"
+                    }
+                }
+                '''
+                
                 batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
                 batch = batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n,
@@ -192,15 +209,36 @@ class AgentPPOTrainer(RayPPOTrainer):
                         batch = self._pad_dataproto_to_world_size(batch=batch)
                     else:
                         final_gen_batch_output, generate_metrics = self.generate_agent_trajectory(timing_raw=timing_raw, meta_info=batch.meta_info)
+                        '''
+                        final_gen_batch_output:DataProto {
+                            attention_mask
+                            input_ids
+                            position_ids
+                            prompts
+                            response_mask
+                            responses
+                            token_level_scores
+                        }
+                        generate_metrics {
+                            traj/steps_...
+                            traj/env_...
+                            traj/llm_...
+                            traj/total_time...
+                            traj_token_mismatch...
+                        }
+                        '''
+                        
                         batch = batch.union(final_gen_batch_output)
                         metrics.update(generate_metrics)
 
                     # compute values
+                    # 对于GRPO，不使用critic
                     if self.use_critic:
                         with marked_timer("values", timing_raw):
                             values = self.critic_wg.compute_values(batch)
                             batch = batch.union(values)
-
+                    
+                    # 优势计算域
                     with marked_timer("adv", timing_raw):
                         # compute scores using reward model and/or reward function
                         if self.use_rm:
@@ -209,9 +247,11 @@ class AgentPPOTrainer(RayPPOTrainer):
 
                         # reward tensor for env-based trajectory data can be obtained by processing the trajectories
                         if "token_level_scores" not in batch.batch:
+                            # 静态数据集的情况，没有走generate_rollout这一part
                             reward_tensor = self.reward_fn(batch)
                             batch.batch["token_level_scores"] = reward_tensor
                         else:
+                            # shape: [Batch, MaxTokens]
                             reward_tensor = batch.batch["token_level_scores"]  # filled in by environment collected trajectory transformation
 
                         # Rejection sampling based on rewards
@@ -316,6 +356,13 @@ class AgentPPOTrainer(RayPPOTrainer):
                         # recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
                             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                            '''
+                            old_log_prob: DataProto{
+                                "entropys":...
+                                "old_log_probs":...
+                            }
+                            '''
+                            
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
                             loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
@@ -324,7 +371,8 @@ class AgentPPOTrainer(RayPPOTrainer):
                             metrics.update(old_log_prob_metrics)
                             old_log_prob.batch.pop("entropys")
                             batch = batch.union(old_log_prob)
-
+                            
+                            # 当存在rollout_log_probs时，同时记录一下对应的metrics
                             if "rollout_log_probs" in batch.batch.keys():
                                 # TODO: we may want to add diff of probs too.
                                 rollout_old_log_probs = batch.batch["rollout_log_probs"]
@@ -348,7 +396,8 @@ class AgentPPOTrainer(RayPPOTrainer):
                                         "training/rollout_probs_diff_std": rollout_probs_diff_std.detach().item(),
                                     }
                                 )
-
+                        
+                        # 对于 use_reference_policy, 
                         if self.use_reference_policy:
                             # compute reference log_prob
                             with marked_timer("ref", timing_raw):
@@ -561,6 +610,9 @@ class AgentPPOTrainer(RayPPOTrainer):
         with marked_timer("collect_trajectory", timing_raw):
             trajectories = []
             if self.async_rollout_mode:
+                # mode="Token": 每条 trajectory 展开为单条连续 token 序列
+                # [prompt_tokens | response_tokens]，response_masks 区分 LLM 输出（1）和环境返回（0）
+                # reward 置于最后一个有效 response token，适用标准 PPO/GRPO 整轨迹训练。
                 gen_seq_generator = self.generate_agent_trajectories_async(timing_raw=timing_raw, meta_info=meta_info, mode="Token")
                 for _, trajectory in enumerate(gen_seq_generator):
                     trajectories.append(trajectory)
@@ -588,6 +640,9 @@ class AgentPPOTrainer(RayPPOTrainer):
             uids = []
         with marked_timer("collect_trajectory", timing_raw):
             steps = []
+            # mode="Step": 每条 trajectory 的每个交互步骤作为独立训练样本返回
+            # 包含 steps 列表（每步 prompt/response 字符串及 ids）和 mc_returns（逐步 MC 回报）
+            # 由 _transform_agent_steps 重新 tokenize，用于 stepwise advantage 估计（per_step/broadcast 模式）
             gen_seq_generator = self.generate_agent_trajectories_async(timing_raw=timing_raw, meta_info=meta_info, mode="Step")
             for _, trajectory in enumerate(gen_seq_generator):
                 steps.append(trajectory)

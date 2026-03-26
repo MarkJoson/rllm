@@ -182,7 +182,56 @@ class AgentExecutionEngine:
         self.agents = agents
 
     async def run_agent_trajectory_async(self, idx, application_id, seed=0, mode="Text", **kwargs):
-        """Run a single agent's trajectory asynchronously"""
+        """
+        异步运行单条 agent 轨迹，并以指定格式返回结果。
+
+        Args:
+            idx: 当前 agent/env 在 self.agents / self.envs 中的索引。
+            application_id: 本次 rollout 请求的唯一 ID（供 rollout engine 使用）。
+            seed: 环境 reset 时的随机种子。
+            mode: 控制返回结果的形态与内容，可选值如下：
+
+                - ``"Token"`` *(标准 PPO/GRPO 训练使用)*
+                  将**整条轨迹展平为一条连续 token 序列**返回。多轮交互
+                  （LLM 输出 + 工具/环境观测）拼接为：
+
+                      [prompt_tokens] + [response_tokens]
+
+                  其中 ``response_masks`` 对 LLM 生成的 token 为 1，对
+                  环境/工具返回的 token 为 0（不计入 loss）。
+                  轨迹 reward 放置在**最后一个有效 response token**（EOS）处。
+
+                  返回 dict 的 key：``prompt_tokens``、``response_tokens``、
+                  ``response_masks``、``trajectory_reward``、``idx``、
+                  ``chat_completions``、``metrics``。
+
+                  **1 条轨迹 → 1 条训练样本。**
+
+                - ``"Step"`` *(stepwise advantage 训练使用)*
+                  将**每个交互步骤作为独立样本**返回。每步保存为
+                  ``(prompt_str, response_str, prompt_ids, completion_ids)`` 元组，
+                  并为每步单独计算 Monte-Carlo return ``mc_returns[i]``。
+                  下游 ``_transform_agent_steps`` 会对每步重新 tokenize
+                  并分配 reward / MC-return。
+
+                  返回 dict 的 key：``steps``（逐步 dict 列表）、
+                  ``trajectory_reward``、``mc_returns``（列表）、
+                  ``idx``、``termination_reason``。
+
+                  **1 条轨迹 → N 条训练样本**（N = 实际交互步数）。
+
+                - ``"Text"``  返回原始 ``Trajectory`` 对象（含文本
+                  observation/action/reward 的 ``Step`` dataclass 列表）。
+
+                - ``"Conversation"``  返回 ``agent.chat_completions``，即
+                  OpenAI 格式的消息列表，适合蒸馏或日志记录。
+
+            **kwargs: 传递给 rollout engine 的额外采样参数
+                （如 ``max_tokens``、``temperature``）。
+
+        Returns:
+            按 ``mode`` 指定格式返回的轨迹数据。
+        """
         agent = self.agents[idx]
         env = self.envs[idx]
         # env_id = env.env_id
@@ -392,6 +441,11 @@ class AgentExecutionEngine:
         compute_trajectory_reward(trajectory)
         compute_mc_return(trajectory, gamma=self.gamma)
 
+        # ── 返回路径选择 ────────────────────────────────────────────────────────
+        # "Token"       : 整条轨迹展平为单条 token 序列（标准 PPO/GRPO 训练）。
+        # "Step"        : 每个交互步骤作为独立样本（stepwise advantage 训练）。
+        # "Text"        : 原始 Trajectory 对象（供调试或非 veRL 场景使用）。
+        # "Conversation": 原始消息列表（供蒸馏或日志记录使用）。
         if mode == "Text":
             return trajectory
         elif mode == "Token":
@@ -495,6 +549,7 @@ class AgentExecutionEngine:
 
         return prompt_tokens, response_tokens, response_masks, is_valid_trajectory
 
+    # 对 run_agent_trajectory_async 进行不断重试的Wrapper
     async def run_agent_trajectory_with_retry(self, idx, seed=0, mode="Text", **kwargs):
         for _ in range(self.retry_limit):
             try:

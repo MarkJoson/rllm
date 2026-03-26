@@ -19,6 +19,7 @@ classifiers = [
 license = {file = "LICENSE"}
 dependencies = [
     "rllm-model-gateway",
+    "torch",
     # CLI
     "click>=8.0",
     "rich>=13.9.4",
@@ -92,7 +93,7 @@ verl = [
     "torch>=2.8.0",
     "torchvision>=0.23.0",
     "vllm>=0.10.2,<=0.12.0",
-    "flash-attn>=2.8.1",
+    # "flash-attn>=2.8.1",
     "qwen-vl-utils",
 ]
 
@@ -158,10 +159,10 @@ override-dependencies = [
     "litellm[proxy]>=1.80.0,<1.82.7",
 ]
 
-[tool.uv.extra-build-dependencies]
-flash-attn = [
-    { requirement = "torch", match-runtime = true },
-]
+# [tool.uv.extra-build-dependencies]
+# flash-attn = [
+#     { requirement = "torch", match-runtime = true },
+# ]
 
 [tool.ruff]
 line-length = 200  # slightly conservative value, turn this on later.
