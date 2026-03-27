@@ -61,6 +61,21 @@ def main(config):
         "backend": kernel_cfg.get("backend", "cuda"),
         "toolkit": kernel_cfg.get("toolkit", "kernelbench"),
         "backend_adapter": kernel_cfg.get("toolkit", "kernelbench"),
+        "use_ray": kernel_cfg.get("use_ray", False),
+        "num_correct_trials": kernel_cfg.get("num_correct_trials", 5),
+        "num_perf_trials": kernel_cfg.get("num_perf_trials", 100),
+        "timeout": kernel_cfg.get("timeout", 300),
+        "reward_func_name": kernel_cfg.get("reward_func_name", "calculate_reward_like_kernel"),
+        "reward_config": {
+            k: v for k, v in {
+                "rate_limit": kernel_cfg.get("rate_limit"),
+                "max_concurrent": kernel_cfg.get("max_concurrent"),
+                "acquire_timeout": kernel_cfg.get("acquire_timeout"),
+                "enable_profiling": kernel_cfg.get("enable_profiling"),
+                "detect_decoy_kernel": kernel_cfg.get("detect_decoy_kernel"),
+                "reference_backend": kernel_cfg.get("reference_backend"),
+            }.items() if v is not None
+        },
     }
 
     trainer = AgentTrainer(
