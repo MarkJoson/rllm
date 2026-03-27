@@ -93,6 +93,7 @@ class SandboxOrchestrator:
         sandbox = self._sandbox_factory(
             name=name,
             image=self._config.image,
+            **self._config.extra,
         )
 
         self._setup_sandbox_sync(sandbox)
@@ -189,6 +190,7 @@ class SandboxOrchestrator:
                 sandbox = self._sandbox_factory(
                     name=f"task-{execution_id[:8]}",
                     image=self._config.image,
+                    **self._config.extra,
                 )
 
                 await self._setup_sandbox(sandbox)

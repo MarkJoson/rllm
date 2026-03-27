@@ -27,14 +27,60 @@ class DockerSandbox:
         self.name = name
         self.image = image
         self._client = docker.from_env()
+
+        # --- Extra volume mounts (SandboxConfig.extra["docker_volumes"]) ---
+        # Format: list of "/host/path:/container/path[:mode]" strings or
+        #         a dict mapping host paths → bind specs.
+        extra_volumes = kwargs.get("docker_volumes", [])
+        volumes: dict = {}
+        if isinstance(extra_volumes, list):
+            for entry in extra_volumes:
+                if isinstance(entry, str) and ":" in entry:
+                    parts = entry.split(":")
+                    host_path = parts[0]
+                    container_path = parts[1]
+                    mode = parts[2] if len(parts) > 2 else "rw"
+                    volumes[host_path] = {"bind": container_path, "mode": mode}
+                elif isinstance(entry, dict):
+                    volumes.update(entry)
+        elif isinstance(extra_volumes, dict):
+            volumes = extra_volumes
+
+        # --- Extra hosts (SandboxConfig.extra["docker_extra_hosts"]) ---
+        # Used to make the container resolve "host.docker.internal" to the
+        # Docker bridge gateway so worker_server.py can POST results to the
+        # LiteLLM proxy running on the host (e.g. 127.0.0.1:4000 from host POV).
+        # Default: add host.docker.internal → host-gateway automatically.
+        extra_hosts_raw = kwargs.get("docker_extra_hosts", {"host.docker.internal": "host-gateway"})
+        extra_hosts: dict[str, str] = {}
+        if isinstance(extra_hosts_raw, dict):
+            extra_hosts = extra_hosts_raw
+        elif isinstance(extra_hosts_raw, list):
+            for entry in extra_hosts_raw:
+                if isinstance(entry, str) and ":" in entry:
+                    host, ip = entry.split(":", 1)
+                    extra_hosts[host] = ip
+
+        # --- Network mode (SandboxConfig.extra["docker_network_mode"]) ---
+        # Default is None (bridge), but can be set to "host" for simpler
+        # host-network access (no extra_hosts needed).
+        network_mode = kwargs.get("docker_network_mode", None)
+
         self._container = self._client.containers.run(
             image,
             command="sleep infinity",
             name=f"rllm-sandbox-{name}",
             detach=True,
             remove=False,
+            volumes=volumes if volumes else None,
+            extra_hosts=extra_hosts if extra_hosts else None,
+            network_mode=network_mode,
         )
-        logger.info("DockerSandbox %s created (container: %s, image: %s)", name, self._container.short_id, image)
+        logger.info(
+            "DockerSandbox %s created (container: %s, image: %s, network_mode: %s)",
+            name, self._container.short_id, image, network_mode or "bridge",
+        )
+
 
     def exec(self, command: str, timeout: float | None = None) -> str:
         """Execute a command inside the container."""
