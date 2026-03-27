@@ -581,11 +581,39 @@ class KernelGymEnv(MultiTurnEnvironment):
     # Factory method
     # ------------------------------------------------------------------
 
+    # Keys that are recognised as environment *configuration* (constructor params).
+    # Everything else in the dict coming from `extra_info` is treated as task data.
+    _ENV_CONFIG_KEYS = frozenset({
+        "kernel_server_url", "max_turns", "num_correct_trials",
+        "num_perf_trials", "timeout", "toolkit", "backend_adapter",
+        "request_timeout", "use_ray", "reward_func_name", "reward_config",
+    })
+
     @staticmethod
     def from_dict(env_args: dict) -> "KernelGymEnv":
-        """Create a KernelGymEnv from a configuration dictionary."""
+        """Create a KernelGymEnv from a configuration dictionary.
+
+        When called from ``AgentPPOTrainer.init_envs_and_agents``, *env_args*
+        is the union of the dataset row (``extra_info``) and the base env
+        config.  Dataset rows contain task-level fields such as
+        ``problem_id``, ``reference_code``, ``description``, etc. — these
+        must be collected into the ``task`` dict rather than forwarded as
+        ``**kwargs`` to ``__init__`` (which would cause a TypeError).
+
+        The split logic: any key in ``_ENV_CONFIG_KEYS`` is an env config
+        parameter; everything else is task data.
+        """
         env_args = dict(env_args)  # avoid mutating caller's dict
-        task = env_args.pop("task", None)
+
+        # If the caller already wrapped the task, honour that.
+        if "task" in env_args:
+            task = env_args.pop("task")
+        else:
+            # Separate env config from task data
+            config = {k: env_args.pop(k) for k in list(env_args) if k in KernelGymEnv._ENV_CONFIG_KEYS}
+            task = env_args if env_args else None  # remaining keys = task data
+            env_args = config
+
         return KernelGymEnv(task=task, **env_args)
 
     @staticmethod
