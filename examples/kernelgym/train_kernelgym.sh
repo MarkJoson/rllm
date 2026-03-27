@@ -75,6 +75,5 @@ python3 -m examples.kernelgym.train_kernelgym \
     trainer.total_epochs=100 \
     kernel.server_url=http://localhost:8000 \
     kernel.backend=cuda \
-    kernel.toolkit=kernelbench \
-    data.train_files=data/kernelbench_train.jsonl \
-    data.val_files=data/kernelbench_val.jsonl
+    kernel.toolkit=kernelbench
+
