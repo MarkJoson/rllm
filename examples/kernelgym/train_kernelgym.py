@@ -1,15 +1,21 @@
 import hydra
 
 from rllm.agents.kernelgym_agent import KernelAgent
-from rllm.data.dataset import Dataset
+from rllm.data.dataset import Dataset, DatasetRegistry
 from rllm.environments.kernelgym.kernelgym_env import KernelGymEnv
 from rllm.trainer.agent_trainer import AgentTrainer
 
 
 @hydra.main(config_path="pkg://rllm.trainer.config", config_name="agent_ppo_trainer", version_base=None)
 def main(config):
-    train_dataset = Dataset.load_data(config.get("data", {}).get("train_files", "data/kernelbench_train.jsonl"))
-    test_dataset = Dataset.load_data(config.get("data", {}).get("val_files", "data/kernelbench_val.jsonl"))
+    # Try DatasetRegistry first; fall back to JSONL file path
+    train_dataset = DatasetRegistry.load_dataset("kernelbench", "train")
+    if train_dataset is None:
+        train_dataset = Dataset.load_data(config.get("data", {}).get("train_files", "data/kernelbench_train.jsonl"))
+
+    test_dataset = DatasetRegistry.load_dataset("kernelbench", "test")
+    if test_dataset is None:
+        test_dataset = Dataset.load_data(config.get("data", {}).get("val_files", "data/kernelbench_val.jsonl"))
 
     agent_args = {
         "system_prompt": (
