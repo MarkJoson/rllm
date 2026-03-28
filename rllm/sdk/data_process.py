@@ -84,7 +84,35 @@ def _clean_message(raw_msg: dict) -> dict[str, str]:
 
 
 def build_llm_output(payload: dict) -> LLMOutput:
-    """Normalize raw OpenAI-style output payloads into LLMOutput."""
+    """Normalize raw OpenAI-style output payloads into LLMOutput.
+    {
+        "id": "chatcmpl-abc123",
+        "object": "chat.completion",
+        "created": 1711000000,
+        "model": "gpt-4o",
+        "choices": [
+            { // 正常回复
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "Hello! How can I help you today?"
+            },
+            "finish_reason": "stop",
+            "provider_specific_fields": {
+                "token_ids": [101, 2054, 2003, 1037, 30522, 102],
+                "response_logprobs": [0.0, -0.1, -0.2, -0.3, -0.4, -0.5]
+            },
+            "logprobs": null
+            },
+        ],
+        "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 9,
+            "total_tokens": 19
+        },
+        "system_fingerprint": "fp_abc123"
+    }
+    """
     if not isinstance(payload, dict):
         raise TypeError(f"LLM output must be dict or LLMOutput, got {type(payload)}")
 
@@ -159,6 +187,7 @@ def trace_to_step(trace: Trace) -> Step:
 
 
 def get_trajectory_name(steps: list[Step], name_key: str | None = None) -> str:
+    '''使用step的name_key字段来获取轨迹名称'''
     if name_key is None:
         return "agent"
     else:
@@ -166,6 +195,7 @@ def get_trajectory_name(steps: list[Step], name_key: str | None = None) -> str:
 
 
 def group_steps(steps: list[Step], by: str | None = None, name_key: str | None = None) -> list[Trajectory]:
+    ''' steps本身按创建时间降序排序，最新的时间在最前 '''
     # if some step doesnt have the group key, we assign a random key to avoid grouping them together
     # in this case, the grpo reduce to reinforce
     if by is None:
@@ -173,6 +203,7 @@ def group_steps(steps: list[Step], by: str | None = None, name_key: str | None =
     else:
         step_groups = defaultdict(list)
         for step in steps:
+            # 根据 {by} 字段进行group聚合，如果某个step没有该字段，则随机分配一个key
             step_groups[step.info.get(by, str(uuid.uuid4()))].append(step)
         return [Trajectory(name=get_trajectory_name(group_steps, name_key), steps=group_steps) for group_key, group_steps in step_groups.items()]
 

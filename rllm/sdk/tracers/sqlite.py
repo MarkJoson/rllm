@@ -303,6 +303,7 @@ class SqliteTracer:
 
         return trace, final_metadata, prepared_session_uids
 
+    # _create_trace_payload+_queue_trace -> _store_queue队列 + 异步线程 -> _store_trace_with_retry
     def log_llm_call(
         self,
         name: str,
@@ -373,6 +374,7 @@ class SqliteTracer:
             session_uids=prepared_session_uids,
         )
 
+    # _create_trace_payload+_store_trace_now -> _store_trace_with_retry
     async def log_llm_call_sync(
         self,
         name: str,

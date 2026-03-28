@@ -517,6 +517,7 @@ class AgentExecutionEngine:
                 response_masks.extend([1] * len(current_completion_ids))  # completion contributes to loss
                 accumulated_sequence.extend(current_completion_ids)
             else:
+                # !!! prompt的前缀，一定是之前请求的历史，如果不是，则说明不是ReAct范式；不能用于训练！
                 if current_prompt_ids[: len(accumulated_sequence)] != accumulated_sequence:
                     # Find the first differing position
                     prefix = current_prompt_ids[: len(accumulated_sequence)]

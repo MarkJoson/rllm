@@ -169,6 +169,7 @@ class AgentSdkEngine:
         pass
 
     async def _execute_with_exception_handling(self, func, task, task_id, rollout_idx, attempt_idx, **kwargs):
+        ''' 构造session_name，同步函数转异步函数，如果是同步函数，则将同步函数放入线程池中执行 '''
         # Format: "{task_id}:{rollout_idx}:{attempt_idx}"
         # This uniquely identifies each rollout attempt
         metadata = {"session_name": f"{task_id}:{rollout_idx}:{attempt_idx}", "task": task}
@@ -189,7 +190,9 @@ class AgentSdkEngine:
             return False, error_tb, None
 
     async def process_task_with_retry(self, task: dict, task_id: str, rollout_idx: int, **kwargs) -> tuple[str, int, int, float, str]:
-        """Process single task rollout with automatic retry on failure.
+        """ 尝试请求完成一条轨迹，并发控制(目前还没启用)+重试+异常处理 
+
+        Process single task rollout with automatic retry on failure.
 
         Executes task with retry logic, using wrapped agent function.
         Semaphore controls concurrency to prevent resource exhaustion.
@@ -213,6 +216,7 @@ class AgentSdkEngine:
             for retry_attempt in range(1, self.retry_limit + 1):
                 uid = f"{task_id}:{rollout_idx}:{retry_attempt}"
                 success, output, session_uid = await self._execute_with_exception_handling(func, task=task, task_id=task_id, rollout_idx=rollout_idx, attempt_idx=retry_attempt, **kwargs)
+                
                 if success and isinstance(output, float | int | bool):
                     colorful_print(f"[{uid}] Rollout completed with reward: {float(output)}", fg="green" if float(output) > 0 else "yellow")
                     return task_id, rollout_idx, retry_attempt, float(output), session_uid
@@ -248,6 +252,7 @@ class AgentSdkEngine:
 
         Returns:
             List of Episode objects with trajectories and rewards.
+            **每一个 session 对应一个episode**
         """
         if self.sema is None:
             await self.initialize_pool()
@@ -260,6 +265,8 @@ class AgentSdkEngine:
         # Capture rollout start time BEFORE launching tasks to ensure all traces are included
         rollout_start_time = time.time()
 
+        # !每个task对象rollout一次，因此如果是要重复rollout时，需要参数传入一个task_id
+        # !此时的 task_states 就不能是在这里初始化了，否则total_rollouts字段就不对了，会丢失上一次的task_id对应的状态
         futures = []
         idx_counter = 0
         for task, task_id in zip(tasks, task_ids, strict=True):
@@ -292,25 +299,40 @@ class AgentSdkEngine:
         flush_success = await self.flush_traces(timeout=60.0)
         flush_time = time.time() - start_time
 
+        # !从Sqlite中，根据session_uid获取traces
         all_traces = []
         collect_trajectory_start = time.time()
         for session_uid in session_uids:
+            '''
+            返回TraceContext: {
+                id=row["id"],
+                data=json.loads(row["data"]),
+                namespace=row["namespace"],
+                type=row["context_type"],
+                metadata=json.loads(row["metadata"]),
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+            }
+            '''
             traces = await self.store.get_by_session_uid(session_uid, since=rollout_start_time)
             all_traces.extend(traces)
         collect_sqlite_time = time.time() - collect_trajectory_start
 
+        # !根据session_name对traces进行分组
         traces_by_session_name = {}
         for session_name in rollout_session_names:
             traces_by_session_name[session_name] = []
 
+        # !这里会排除一部分 rollout_fn 自定义的 session_name
         for trace in all_traces:
             session_name = trace.data.get("session_name", None)
             if not session_name or session_name not in rollout_session_names:
                 continue
             trace_obj = Trace(**trace.data)
             traces_by_session_name[session_name].append((trace.id, trace_obj))
-
-        for session_name, traces in traces_by_session_name.items():
+        
+        # 每个trace与step配对。将trace转成step后聚合分组，标记奖励值
+        for session_name, traces in traces_by_session_name.items():     # (trace_id, trace_obj)
             steps = [trace_to_step(entry[1]) for entry in traces]
             step_id_to_step = {entry[0]: step for entry, step in zip(traces, steps, strict=False)}
 
@@ -323,8 +345,15 @@ class AgentSdkEngine:
             else:
                 output = output_or_tuple
                 metrics = {}
-
+            
+            '''
+            根据用户返回的两种情况，有两种处理方式：
+            1. 如果用户返回的是float，说明用户没有提供traj_proto，那么就根据groupby_key和traj_name_key对steps进行分组，生成trajectories
+            2. 如果用户返回的是list[Trajectory]，说明用户提供了traj_proto，那么就根据traj_proto中的step_id_to_step进行分组，生成trajectories
+            '''
+            output:list[Trajectory]
             if isinstance(output, float):
+                # 根据groupby_key
                 trajectories = group_steps(steps, by=self.groupby_key, name_key=self.traj_name_key)
                 # fill reward for each trajectory using the final reward
                 for trajectory in trajectories:
@@ -334,6 +363,7 @@ class AgentSdkEngine:
                 # assemble and assign rewards based on user provide traj_proto
                 trajectories = []
                 for traj_proto in output:
+                    # 根据用户提供的轨迹进行分组
                     steps_no_rw = [step_id_to_step.get(step.id, None) for step in traj_proto.steps]
                     for step_proto, step in zip(traj_proto.steps, steps_no_rw, strict=True):
                         if step is None:
@@ -377,6 +407,7 @@ class AgentSdkEngine:
 
         results = []
         sorted_tasks = sorted(task_states.keys(), key=lambda task_id: task_states[task_id]["idx"])
+        # 按照task的顺序依次append出episode
         for task_id in sorted_tasks:
             results.extend(task_states[task_id]["episodes"])
         return results
@@ -391,6 +422,8 @@ class AgentSdkEngine:
 
             error_count = 0
             for episode in results:
+                # !只有_execute_tasks有异常才会返回None，而且如果result中某一个是None，那么其他的也一定是None
+                # 因为_execute_tasks函数不会返回部分失败
                 if episode is None:
                     error_count += 1
                     continue

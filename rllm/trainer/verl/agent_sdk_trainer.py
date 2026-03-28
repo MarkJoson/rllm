@@ -622,6 +622,7 @@ class AgentSdkTrainer(RayPPOTrainer):
             timing_raw = {}
 
         with marked_timer("generate_trajectories", timing_raw, color="red"):
+            # 这里会把任务提交到附属的thread上..., 然后等待结果
             coro = self.agent_execution_engine.execute_tasks_verl(batch, **kwargs)
             final_gen_batch_output = asyncio.run_coroutine_threadsafe(coro, self._loop).result()
 
