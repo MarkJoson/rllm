@@ -1,6 +1,6 @@
 # rLLM SDK 完整中文指南
 
-> 本文档整合自：`docs/core-concepts/sdk.md`、`docs/examples/sdk_math.md`、`docs/examples/sdk_langgraph_rag.md`、`rllm/sdk/README.md` 及相关源码注释。
+> 本文档整合自：`docs/core-concepts/sdk.md`、`docs/examples/sdk_math.md`、`docs/examples/sdk_langgraph_rag.md`、`rllm/sdk/README.md` 及相关源码注释。最后更新于 rebase 后（含 TinkerProxy、LangGraph 回调集成、SmolAgents 等新增内容）。
 
 ---
 
@@ -21,11 +21,14 @@
    - [数据模型](#64-数据模型)
 7. [教程一：训练数学解题 Agent（入门）](#7-教程一训练数学解题-agent入门)
 8. [教程二：训练 LangGraph RAG Agent（进阶）](#8-教程二训练-langgraph-rag-agent进阶)
-9. [进阶：细粒度 Session 控制](#9-进阶细粒度-session-控制)
-10. [Session 后端：ContextVar vs OpenTelemetry](#10-session-后端contextvar-vs-opentelemetry)
-11. [SDK 内部架构与目录结构](#11-sdk-内部架构与目录结构)
-12. [设计原则](#12-设计原则)
-13. [参考资料](#13-参考资料)
+9. [教程三：集成其他 Agent 框架](#9-教程三集成其他-agent-框架)
+   - [LangGraph 回调模式（新）](#91-langgraph-回调模式新--无需注入客户端)
+   - [SmolAgents](#92-smolagents)
+10. [进阶：细粒度 Session 控制](#10-进阶细粒度-session-控制)
+11. [Session 后端：ContextVar vs OpenTelemetry](#11-session-后端contextvar-vs-opentelemetry)
+12. [SDK 内部架构与目录结构](#12-sdk-内部架构与目录结构)
+13. [设计原则](#13-设计原则)
+14. [参考资料](#14-参考资料)
 
 ---
 
@@ -1092,7 +1095,154 @@ bash examples/sdk/langgraph/train_rag_agent.sh
 
 ---
 
-## 9. 进阶：细粒度 Session 控制
+## 9. 教程三：集成其他 Agent 框架
+
+rLLM SDK 提供了多种方式将训练追踪集成到主流 Agent 框架中，采用回调/Hook 模式不需要替换发射客户端。
+
+```mermaid
+flowchart LR
+    subgraph 集成方式
+        direction TB
+        A["📕 客户端注入\n(LangGraph 旧方式)"]
+        B["📞 回调处理器\nRLLMTrajectoryCallbackHandler"]
+        C["🔊 模型包装器\nRLLMSmolAgentsTracer"]
+        D["🔌 Hook 接口\nRLLMTrajectoryHooks"]
+    end
+
+    B -->|"LangGraph / LangChain"| RES["🏆 Trajectory 对象\n可直接赋奖励"]
+    C -->|"SmolAgents"| RES
+    D -->|"OpenAI Agents SDK"| RES
+    A -->|"旧兴趣点"| RES
+```
+
+### 9.1 LangGraph 回调模式（新）—— 无需注入客户端
+
+> **更新**：旧文档中介绍的"客户端注入"方式仍然支持，但现在有更简洁的方式：使用 `RLLMTrajectoryCallbackHandler`。
+
+`RLLMTrajectoryCallbackHandler` 是一个标准的 LangChain `BaseCallbackHandler`，可以在不修改任何现有代码的情况下插入到任意 LangChain/LangGraph Agent。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant User as 用户代码
+    participant Agent as LangGraph Agent
+    participant CB as RLLMTrajectoryCallbackHandler
+    participant LLM as ChatOpenAI
+
+    User->>CB: cb = RLLMTrajectoryCallbackHandler()
+    User->>Agent: agent.invoke({...}, config={"callbacks": [cb]})
+    Agent->>CB: on_chat_model_start(messages)
+    Note over CB: 记录 pending_messages & 计时
+    Agent->>LLM: LLM 推理
+    LLM-->>Agent: 响应
+    Agent->>CB: on_llm_end(response)
+    Note over CB: 构建 Trace，存入 _traces[]
+    Note over Agent: 如使用工具
+    Agent->>CB: on_tool_end(output)
+    Note over CB: 将工具结果注入最近 Trace.metadata
+    User->>CB: traj = cb.get_trajectory()
+    Note over CB: 一次性构建 Trajectory
+    User->>User: traj.reward = 1.0 if correct else 0.0
+```
+
+**使用示例：**
+
+```python
+from langchain_openai import ChatOpenAI
+from langgraph.prebuilt import create_react_agent
+from rllm.sdk.integrations.langgraph import RLLMTrajectoryCallbackHandler
+
+# 创建回调处理器（无需修改 LLM 或 Agent 代码）
+cb = RLLMTrajectoryCallbackHandler()
+
+# 普通的 ChatOpenAI，不需要注入任何内容
+llm = ChatOpenAI(model="Qwen/Qwen3-4B", base_url="http://localhost:4000/v1")
+agent = create_react_agent(llm, tools=[retriever_tool])
+
+# 通过 config 传入回调处理器
+result = agent.invoke(
+    {"messages": [("user", "What year was the Eiffel Tower built?")]},
+    config={"callbacks": [cb]},
+)
+
+# 获取轨迹并设置奖励
+traj = cb.get_trajectory()
+print(f"捕获了 {len(traj.steps)} 步")
+print(f"Agent 输出：{traj.output}")
+
+# 设置奖励
+traj.reward = 1.0 if "1889" in str(traj.output) else 0.0
+
+# 删除上一轮数据，准备下一轮
+cb.clear()
+```
+
+**`RLLMTrajectoryCallbackHandler` API：**
+
+| 方法 | 说明 |
+|------|------|
+| `get_trajectory()` | 返回最近一次 Agent 运行的 `Trajectory`（自动构建） |
+| `get_trajectories()` | 返回所有收集到的 `Trajectory` 列表 |
+| `get_traces()` | 返回原始 `Trace` 对象列表 |
+| `clear()` | 清除所有数据，为下一轮新运行准备 |
+
+> **注意**：ChatOpenAI 不再需要 `client=` 注入，回调处理器通过 LangChain 的 `BaseCallbackHandler` 内部事件捕获所有 LLM 调用。不需要 LiteLLM Proxy 迂回，不捕获 token IDs。
+
+### 9.2 SmolAgents
+
+`RLLMSmolAgentsTracer` 通过包装模型（而非客户端）来拦截 LLM 调用。
+
+```mermaid
+flowchart LR
+    SA_Model["原始 SmolAgents 模型\nOpenAIServerModel('gpt-4o')"] -->|"tracer.wrap_model()"| Wrapped["_TracingModelWrapper包装器"]
+    Wrapped -->|"Agent 调用模型"| Call["模型.__call__(messages)"]
+    Call -->|"1. 捕获输入"| Tracer_IN["_smolagents_messages_to_openai()"]
+    Call -->|"2. 委托给原始模型"| SA_Model
+    Call -->|"3. 捕获输出"| Tracer_OUT["构建 Trace\n添加到 _traces[]"]
+    Tracer_OUT --> TJ["tracer.get_trajectory()"]
+```
+
+```python
+from smolagents import ToolCallingAgent, OpenAIServerModel
+from rllm.sdk.integrations.smolagents import RLLMSmolAgentsTracer
+
+# 创建 Tracer
+tracer = RLLMSmolAgentsTracer()
+
+# 包装模型而非客户端
+model = OpenAIServerModel(
+    model_id="Qwen/Qwen3-4B",
+    api_base="http://localhost:4000/v1"
+)
+wrapped_model = tracer.wrap_model(model)
+
+# 使用包装后的模型创建 Agent
+agent = ToolCallingAgent(tools=[search_tool], model=wrapped_model)
+result = agent.run("What is the population of France?")
+
+# 获取轨迹并设置奖励
+traj = tracer.get_trajectory()
+print(f"捕获了 {len(traj.steps)} 步")
+traj.reward = 1.0 if "67" in str(traj.output) else 0.0
+
+# 清除下一轮
+tracer.clear()
+```
+
+**不同集成方式对比：**
+
+| 框架 | 集成类 | 方式 | 是否捕获 token IDs |
+|------|------|------|------|
+| LangGraph/LangChain | `RLLMTrajectoryCallbackHandler` | 回调处理器 | ♥ 取决于 LLM 配置 |
+| SmolAgents | `RLLMSmolAgentsTracer` | 模型包装器 | ♥ 取决于服务器 |
+| OpenAI Agents SDK | `RLLMTrajectoryHooks` | Hook 接口 | ♦ 取决于配置 |
+| Google ADK | `RLLMTrajectoryPlugin` | 插件 | ♦ 取决于配置 |
+| Strands | `RLLMTrajectoryHookProvider` | Hook 接口 | ♦ 取决于配置 |
+| 任意 Python（直接） | `get_chat_client()` | SDK 客户端注入 | ✓ 通过 TinkerProxy |
+
+---
+
+## 10. 进阶：细粒度 Session 控制
 
 ### 何时需要显式 Session？
 
@@ -1128,8 +1278,10 @@ with session(experiment="v1", task_id="math_001", difficulty="hard") as sess:
 ```python
 from langgraph.graph import StateGraph, MessagesState
 from rllm.sdk import get_chat_client, session
+from rllm.sdk.integrations.langgraph import RLLMTrajectoryCallbackHandler
 
 client = get_chat_client(base_url="http://localhost:4000/v1")
+handler = RLLMTrajectoryCallbackHandler()
 
 async def agent_step(state: MessagesState):
     response = await client.chat.completions.create(
@@ -1145,12 +1297,12 @@ graph = workflow.compile()
 
 # 使用显式 session 精细控制追踪
 with session(task_id="hotpotqa_001", max_turns=5):
-    result = await graph.ainvoke({"messages": [...]})
+    result = await graph.ainvoke({"messages": [...]}, config={"callbacks": [handler]})
 ```
 
 ---
 
-## 10. Session 后端：ContextVar vs OpenTelemetry
+## 11. Session 后端：ContextVar vs OpenTelemetry
 
 SDK 支持两种 Session 后端，在 `rllm/sdk/config.yaml` 中配置：
 
@@ -1230,7 +1382,7 @@ OpenTelemetry 后端特性：
 
 ---
 
-## 11. SDK 内部架构与目录结构
+## 12. SDK 内部架构与目录结构
 
 ```
 rllm/sdk/
@@ -1245,7 +1397,8 @@ rllm/sdk/
 │   ├── base.py              # SessionProtocol、wrap_with_session_context()
 │   ├── contextvar.py        # ContextVarSession（默认后端）
 │   ├── opentelemetry.py     # OpenTelemetrySession（W3C baggage 方案）
-│   └── session_buffer.py    # SessionBuffer（临时 trace 存储）
+│   ├── session_buffer.py    # SessionBuffer（临时 trace 存储）
+│   └── storage.py           # 存储协议：InMemoryStorage + SqliteSessionStorage
 ├── chat/
 │   ├── __init__.py          # Chat 客户端导出
 │   ├── openai.py            # 统一 OpenAI 聊天客户端（所有客户端类型）
@@ -1256,7 +1409,9 @@ rllm/sdk/
 │   ├── litellm_server.py    # LiteLLM 服务器集成
 │   ├── metadata_slug.py     # URL 元数据编解码
 │   ├── middleware.py        # MetadataRoutingMiddleware（ASGI）
-│   └── proxy_manager.py    # 代理生命周期管理
+│   ├── proxy_manager.py     # 代理生命周期管理
+│   ├── tinker_proxy.py      # TinkerProxy：单跳架构代理（新）
+│   └── tinker_backend_server.py # TinkerEngine HTTP 请求模型（新）
 ├── tracers/
 │   ├── __init__.py          # Tracer 导出
 │   ├── base.py              # TracerProtocol 接口定义
@@ -1266,10 +1421,40 @@ rllm/sdk/
 │   ├── __init__.py          # Store 导出
 │   └── sqlite_store.py      # SQLite trace 持久化存储
 └── integrations/
+    ├── __init__.py          # 集成包导出
     ├── adk.py               # Google ADK 插件（RLLMTrajectoryPlugin）
     ├── openai_agents.py     # OpenAI Agents SDK 钩子（RLLMTrajectoryHooks）
-    └── strands.py           # Strands Agents SDK 钩子（RLLMTrajectoryHookProvider）
+    ├── strands.py           # Strands Agents SDK 钩子（RLLMTrajectoryHookProvider）
+    ├── smolagents.py        # SmolAgents 集成（RLLMSmolAgentsTracer）（新）
+    └── langgraph.py         # LangGraph 回调集成（RLLMTrajectoryCallbackHandler）（新）
 ```
+
+### TinkerProxy：新增的单跳架构代理
+
+rebase 后新增了 `TinkerProxy`，相比原有的 LiteLLM 双跳架构（LiteLLM Proxy → TinkerBackendServer），它是单跳的：
+
+```mermaid
+flowchart LR
+    subgraph 旧架构["❌ 旧架构（双跳）"]
+        direction TB
+        A1["Agent\nOpenAI 客户端"] -->|"HTTP"| B1["LiteLLM Proxy"]
+        B1 -->|"HTTP"| C1["TinkerBackendServer"]
+        C1 -->|"进程内"| D1["TinkerEngine"]
+    end
+
+    subgraph 新架构["✅ TinkerProxy（单跳）"]
+        direction TB
+        A2["Agent\nOpenAI 客户端"] -->|"HTTP"| B2["TinkerProxy :4000"]
+        B2 -->|"进程内直接调用"| C2["TinkerEngine.get_model_response()"]
+        B2 -->|"将 Trace 写入"| D2["SqliteTracer"]
+    end
+```
+
+TinkerProxy 在单一进程中处理：
+1. 从 URL `slug` 字段解析元数据
+2. 调用 `rollout_engine.get_model_response()` 进行推理
+3. 调用 `tracer.log_llm_call()` 持久化 Trace
+4. 返回 OpenAI 兼容响应
 
 ### 核心流程：客户端如何拦截调用
 
@@ -1406,11 +1591,33 @@ flowchart TB
     SQ --> ST
     OAI --> PR
     CV --> BUF
+
+    subgraph INTEG["框架集成层"]
+        LG["integrations/langgraph.py\nRLLMTrajectoryCallbackHandler"]
+        SMOL["integrations/smolagents.py\nRLLMSmolAgentsTracer"]
+        ADK["integrations/adk.py\nRLLMTrajectoryPlugin"]
+        OAIA["integrations/openai_agents.py\nRLLMTrajectoryHooks"]
+    end
+
+    subgraph TINKER["TinkerProxy（新增）"]
+        TP["proxy/tinker_proxy.py\nTinkerProxy"]
+        TBS["proxy/tinker_backend_server.py\n请求模型定义"]
+    end
+
+    LG & SMOL & ADK & OAIA --> PR
+    TP --> SLUG
+    TP --> SQ
+    TBS --> TP
+
+    subgraph STORAGE2["新增存储层"]
+        SS["session/storage.py\nInMemoryStorage\nSqliteSessionStorage"]
+    end
+    CV --> SS
 ```
 
 ---
 
-## 12. 设计原则
+## 13. 设计原则
 
 | 原则 | 说明 |
 |------|------|
@@ -1424,7 +1631,7 @@ flowchart TB
 
 ---
 
-## 13. 参考资料
+## 14. 参考资料
 
 - [重分词问题在 RL 训练中的影响](https://wandb.ai/tianhaowu/rllm-agent/reports/Tokenization-Mismatch-in-Text-Level-Operations--VmlldzoxNDg0MTcwMw)
 - [VERL：分布式 RL 训练框架](https://github.com/volcengine/verl)
