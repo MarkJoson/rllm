@@ -43,7 +43,11 @@ def _ensure_tracer_initialized(service_name: str | None = None) -> None:
 
 
 def wrap_with_session_context(agent_func, *, tracer_service_name: str | None = None):
-    """Wrap an agent function so each invocation runs inside a session context."""
+    """Wrap an agent function so each invocation runs inside a session context.
+    返回一个带session上下文包装的用户函数 wrap_fn(session_name, ...)。
+    其中第一个函数在调用时会传入session_name用于区分不同session.
+    根据sdk中的定义, session name的格式是 {task_id}:{rollout_idx}:{attempt_idx}
+    """
     from rllm.sdk.shortcuts import _session_with_name
 
     if inspect.iscoroutinefunction(agent_func):
