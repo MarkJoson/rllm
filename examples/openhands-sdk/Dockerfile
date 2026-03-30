@@ -1,53 +1,60 @@
-# Dockerfile for the rllm OpenHands sandbox worker.
+# =============================================================================
+# Dockerfile for the rllm sandbox worker container (examples/openhands-sdk)
 #
-# This image runs the rllm worker_server.py and the OpenHands Python app
-# (openhands_agent.py) inside the outer rllm sandbox container.
+# This container is managed by rllm's SandboxOrchestrator / DockerSandbox.
+# It runs worker_server.py and the openhands_agent.py rollout function.
 #
-# OpenHands itself will spawn a SEPARATE per-rollout Docker container
-# (the "runtime" container) for isolated code execution.  For this to work,
-# /var/run/docker.sock must be mounted into this container at runtime:
+# It does NOT contain OpenHands itself — OpenHands runs in its own separate
+# container launched by openhands_agent.py via the Docker daemon socket.
 #
-#   docker run --rm \
-#     -v /var/run/docker.sock:/var/run/docker.sock \
-#     rllm-openhands-sandbox ...
+# Layer topology:
 #
-# The SandboxOrchestrator handles this via SandboxConfig.extra["docker_volumes"].
+#   Host
+#   └─ rllm sandbox container  (this image)
+#        ├─ worker_server.py   ← managed by SandboxOrchestrator
+#        └─ rollout()          ← calls docker run → OpenHands container
+#             └─ OpenHands container (ghcr.io/all-hands-ai/openhands)
 #
 # Build:
-#   docker build -t rllm-openhands-sandbox -f examples/openhands/Dockerfile .
-#
-# The orchestrator will:
-#   1. Upload agent code to /app/agent
-#   2. Upload worker_server.py to /app/runner
-#   3. Install rllm[sdk] if configured
-#   4. Start worker_server.py as the agent process
-#
+#   docker build -t rllm-openhands-sandbox \
+#       -f examples/openhands-sdk/Dockerfile .
+# =============================================================================
+
 FROM python:3.11-slim
 
-# System dependencies:
-#   - git: for repo cloning in _setup_workspace
-#   - curl: health-check probes inside the container
-#   - build-essential: C extensions for some Python packages
-#   - docker.io: Docker CLI (for manual debugging; daemon access via socket)
+# ---------------------------------------------------------------------------
+# System dependencies
+# ---------------------------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        git \
-        curl \
-        build-essential \
-        docker.io \
+    # Git — for cloning repos in _setup_workspace()
+    git \
+    # curl — for health-check polling inside DockerSandbox._wait_for_ready()
+    curl \
+    # docker-cli — fallback if Docker SDK is not sufficient (optional)
+    docker.io \
     && rm -rf /var/lib/apt/lists/*
 
-# Python packages:
-#   - openhands-ai: the OpenHands app runs IN THIS CONTAINER in-process.
-#                   It manages the runtime container via /var/run/docker.sock.
-#   - aiohttp: required by worker_server.py
-#   - pytest:  used in _default_reward for test evaluation
+# ---------------------------------------------------------------------------
+# Python dependencies
+# ---------------------------------------------------------------------------
 RUN pip install --no-cache-dir \
-        openhands-ai \
-        aiohttp \
-        pytest
+    # HTTP server for worker_server.py
+    aiohttp \
+    # Docker SDK — used by openhands_agent.py to launch OpenHands containers
+    docker
 
-# Working directory for agent code (uploaded by orchestrator)
-WORKDIR /app/agent
+# ---------------------------------------------------------------------------
+# App layout
+#   /app/runner/   — worker_server.py (uploaded by SandboxOrchestrator)
+#   /app/agent/    — openhands_agent.py (uploaded by SandboxOrchestrator)
+# ---------------------------------------------------------------------------
+RUN mkdir -p /app/runner /app/agent
 
-# Default command — overridden by orchestrator's start_agent_process
-CMD ["bash"]
+WORKDIR /app
+
+# Default entrypoint (overridden by SandboxOrchestrator via start_agent_process)
+CMD ["python", "/app/runner/worker_server.py", \
+     "--agent-module", "openhands_agent", \
+     "--agent-func", "rollout", \
+     "--agent-dir", "/app/agent", \
+     "--port", "8100"]
