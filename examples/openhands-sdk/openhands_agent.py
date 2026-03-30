@@ -4,18 +4,21 @@ OpenHands agent — rollout function for rllm training.
 Architecture:
     rllm training process
     └─ rollout(task, config)
-         ├─ build_proxied_base_url(proxy_url, metadata)  ← metadata slug for session tracking
-         └─ docker run ghcr.io/all-hands-ai/openhands
-              └─ OpenHands headless → LLM calls → rllm LiteLLM proxy (proxied URL)
+         ├─ _build_proxied_base_url(proxy_url, metadata)  ← metadata slug
+         └─ docker run rllm-openhands  (workspace/Dockerfile)
+              └─ workspace/entrypoint.py
+                   └─ OpenHands SDK (LLM, Agent, Conversation, Tool)
+                        └─ LLM calls → LLM_BASE_URL (proxied) → rllm proxy
 
-No openhands Python library is imported. OpenHands runs entirely inside
-its own Docker container. The proxied base URL (with embedded metadata slug)
-is passed as LLM_BASE_URL so the rllm proxy can attribute all LLM calls
-to the correct training session.
+No openhands Python library is imported in this file. OpenHands runs entirely
+inside its own container (built from workspace/Dockerfile). The proxied base
+URL with embedded metadata slug is passed as LLM_BASE_URL into the container
+so the rllm proxy can attribute all LLM calls to the correct session.
 
-Environment Variables (forwarded into OpenHands container):
-    OPENHANDS_IMAGE             : OpenHands Docker image
-                                  Default: ghcr.io/all-hands-ai/openhands:0.28
+Environment Variables:
+    OPENHANDS_IMAGE             : Custom rllm-openhands image
+                                  (built from workspace/Dockerfile)
+                                  Default: rllm-openhands
     OPENHANDS_SANDBOX_IMAGE     : Runtime image used by OpenHands internally
                                   Default: docker.all-hands.dev/all-hands-ai/runtime:0.28-nikolaik
     OPENHANDS_MODEL_NAME        : Model name on the LiteLLM proxy
@@ -43,13 +46,9 @@ logger = logging.getLogger(__name__)
 # Config from environment
 # ---------------------------------------------------------------------------
 
-_OPENHANDS_IMAGE = os.environ.get(
-    "OPENHANDS_IMAGE", "ghcr.io/all-hands-ai/openhands:0.28"
-)
-_RUNTIME_IMAGE = os.environ.get(
-    "OPENHANDS_SANDBOX_IMAGE",
-    "docker.all-hands.dev/all-hands-ai/runtime:0.28-nikolaik",
-)
+# Custom image built from workspace/Dockerfile (based on official OpenHands
+# image but with workspace/entrypoint.py pre-installed as ENTRYPOINT).
+_OPENHANDS_IMAGE = os.environ.get("OPENHANDS_IMAGE", "rllm-openhands")
 _MODEL_NAME = os.environ.get("OPENHANDS_MODEL_NAME", "openai/openhands-model")
 _MAX_ITERATIONS = int(os.environ.get("OPENHANDS_MAX_ITERATIONS", "30"))
 _CONTAINER_TIMEOUT = int(os.environ.get("OPENHANDS_CONTAINER_TIMEOUT", "600"))
@@ -164,27 +163,37 @@ def _run_openhands_container(
         "docker", "run",
         "--rm",
         "--name", container_name,
-        # LLM config — proxied_url carries the rllm metadata slug
+
+        # --- LLM routing ---
+        # proxied_url carries the rllm metadata slug so every LLM call made
+        # by OpenHands SDK (via workspace/entrypoint.py) is attributed to
+        # this training session by the rllm LiteLLM proxy.
         "-e", f"LLM_BASE_URL={proxied_url}",
         "-e", "LLM_API_KEY=EMPTY",
         "-e", f"LLM_MODEL={_MODEL_NAME}",
-        # OpenHands sandbox settings
-        "-e", f"SANDBOX_RUNTIME_CONTAINER_IMAGE={_RUNTIME_IMAGE}",
-        "-e", f"SANDBOX_USER_ID={os.getuid()}",
+
+        # --- Task ---
+        # Passed as env var; entrypoint.py reads it and sends to Conversation.
+        "-e", f"TASK_INSTRUCTION={instruction}",
+
+        # --- Workspace ---
+        # The host workspace dir is mounted; the agent operates directly
+        # inside the container — no inner sandbox is created.
+        "-e", "WORKSPACE_BASE=/opt/workspace",
+        "-v", f"{workspace}:/opt/workspace",
+
+        # --- Agent iterations ---
         "-e", f"MAX_ITERATIONS={_MAX_ITERATIONS}",
-        # Workspace: OpenHands reads from /opt/workspace_base
-        "-e", f"WORKSPACE_MOUNT_PATH={workspace}",
-        "-v", f"{workspace}:/opt/workspace_base",
-        # Docker socket: OpenHands needs to spawn its own runtime containers
-        "-v", "/var/run/docker.sock:/var/run/docker.sock",
-        # Reach host (LiteLLM proxy) from inside the container
+
+        # --- Network ---
+        # host.docker.internal resolves to the training host so the agent
+        # can reach the LiteLLM proxy.
         "--add-host", "host.docker.internal:host-gateway",
+
+        # Custom image built from workspace/Dockerfile.
+        # ENTRYPOINT = workspace/entrypoint.py (new OpenHands SDK).
+        # No docker.sock mount needed — no inner sandbox.
         _OPENHANDS_IMAGE,
-        # Headless invocation
-        "python", "-m", "openhands.core.main",
-        "-t", instruction,
-        "--no-auto-continue",
-        "--headless",
     ]
 
     logger.info(

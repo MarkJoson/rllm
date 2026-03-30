@@ -35,7 +35,10 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 # OpenHands container settings
 # (read by openhands_agent.py → forwarded into each OpenHands container)
 # ------------------------------------------------------------------------------
-export OPENHANDS_IMAGE="${OPENHANDS_IMAGE:-ghcr.io/all-hands-ai/openhands:0.28}"
+# Custom rllm-openhands image (built from workspace/Dockerfile).
+# This image extends the official OpenHands image with workspace/entrypoint.py
+# which uses the new OpenHands SDK (LLM, Agent, Conversation, Tool).
+export OPENHANDS_IMAGE="${OPENHANDS_IMAGE:-rllm-openhands}"
 export OPENHANDS_SANDBOX_IMAGE="${OPENHANDS_SANDBOX_IMAGE:-docker.all-hands.dev/all-hands-ai/runtime:0.28-nikolaik}"
 export OPENHANDS_MODEL_NAME="${OPENHANDS_MODEL_NAME:-openai/openhands-model}"
 export OPENHANDS_MAX_ITERATIONS="${OPENHANDS_MAX_ITERATIONS:-30}"
@@ -60,9 +63,18 @@ echo "  OpenHands image : ${OPENHANDS_IMAGE}"
 echo "  Max iterations  : ${OPENHANDS_MAX_ITERATIONS}"
 
 # ------------------------------------------------------------------------------
-# Pre-pull OpenHands image to avoid cold-start latency during training
+# Build the custom rllm-openhands image from workspace/Dockerfile.
+# This image extends the official OpenHands base with workspace/entrypoint.py
+# (uses new OpenHands SDK: LLM, Agent, Conversation, Tool).
+# Rebuild only if image doesn't exist or FORCE_BUILD=1 is set.
 # ------------------------------------------------------------------------------
-docker pull "${OPENHANDS_IMAGE}" || true
+if [ "${FORCE_BUILD:-0}" = "1" ] || ! docker image inspect "${OPENHANDS_IMAGE}" &>/dev/null; then
+    echo "Building custom OpenHands image: ${OPENHANDS_IMAGE}"
+    docker build \
+        -t "${OPENHANDS_IMAGE}" \
+        -f examples/openhands-sdk/workspace/Dockerfile \
+        examples/openhands-sdk/workspace
+fi
 
 # ------------------------------------------------------------------------------
 # Launch training
