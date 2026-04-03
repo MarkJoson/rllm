@@ -17,6 +17,7 @@
 #   N_GPUS              — number of GPUs per node
 #   PROXY_PORT          — LiteLLM proxy port
 #   OPENHANDS_IMAGE     — OpenHands Docker image to run per rollout
+#   OPENHANDS_DATASET   — swe (default) | mock_npu  (算子 bring-up：mock parquet + profiling mock)
 # ==============================================================================
 set -euo pipefail
 set -x
@@ -26,7 +27,7 @@ set -x
 # ------------------------------------------------------------------------------
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False"
-export VLLM_USE_V1=1
+export VLLM_USE_V1=0
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
@@ -113,10 +114,12 @@ python3 -m examples.openhands_sdk.train_openhands \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.mode=async \
-    actor_rollout_ref.rollout.enforce_eager=False \
+    actor_rollout_ref.rollout.enforce_eager=True \
     actor_rollout_ref.rollout.temperature=1.0 \
     actor_rollout_ref.rollout.top_p=1.0 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.enable_auto_tool_choice=True \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.tool_call_parser=hermes \
     actor_rollout_ref.rollout.n=4 \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.0 \
