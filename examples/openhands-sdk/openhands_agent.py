@@ -1,33 +1,33 @@
 """
-OpenHands agent — rollout function for rllm training.
+OpenHands agent — rollout function for rllm NPU operator training.
 
 Architecture:
     rllm training process
     └─ rollout(...)  # AgentSdkEngine passes extra_info as kwargs
-         ├─ assemble_routing_metadata + build_proxied_base_url (rllm.sdk.proxy.metadata_slug)
-         └─ docker run rllm-openhands  (workspace/Dockerfile)
-              └─ workspace/entrypoint.py
+         ├─ assemble_routing_metadata + build_proxied_base_url
+         └─ docker run <OPENHANDS_IMAGE>  (pre-built image)
+              └─ workspace/entrypoint.py (read-only mount)
                    └─ OpenHands SDK (LLM, Agent, Conversation, Tool)
                         └─ LLM calls → LLM_BASE_URL (proxied) → rllm proxy
 
 No openhands Python library is imported in this file. OpenHands runs entirely
-inside its own container (built from workspace/Dockerfile). The proxied base
-URL with embedded metadata slug is passed as LLM_BASE_URL into the container
-so the rllm proxy can attribute all LLM calls to the correct session.
+inside its own container. The proxied base URL with embedded metadata slug is
+passed as LLM_BASE_URL into the container so the rllm proxy can attribute all
+LLM calls to the correct session.
 
 Depends on ``rllm.sdk.proxy.metadata_slug`` (``assemble_routing_metadata`` /
 ``build_proxied_base_url``) for URL slug construction.
 
 Environment Variables:
-    OPENHANDS_IMAGE             : Custom rllm-openhands image
-                                  (built from workspace/Dockerfile)
-                                  Default: rllm-openhands
-    OPENHANDS_SANDBOX_IMAGE     : Runtime image used by OpenHands internally
-                                  Default: docker.all-hands.dev/all-hands-ai/runtime:0.28-nikolaik
-    OPENHANDS_MODEL_NAME        : Model name on the LiteLLM proxy
-                                  Default: openai/openhands-model
+    OPENHANDS_IMAGE             : Pre-built OpenHands image. Default: rllm-openhands
+    OPENHANDS_MODEL_NAME        : Model name on the LiteLLM proxy (without
+                                  provider prefix; ``openai/`` is prepended
+                                  automatically). Default: openhands-model
     OPENHANDS_MAX_ITERATIONS    : Max agent iterations, default 30
     OPENHANDS_CONTAINER_TIMEOUT : Seconds to wait for container, default 600
+    OPENHANDS_ARTIFACT_DIR      : Persistent directory for archiving rollout
+                                  artifacts. Empty to disable (default).
+    OPENHANDS_MOCK_PIPELINE     : "1" to use mock operator pipeline. Default: "0"
 """
 
 from __future__ import annotations
@@ -39,20 +39,30 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 import uuid
-from urllib.parse import urlparse, urlunparse
 from typing import Any
+from urllib.parse import urlparse, urlunparse
 
 from rllm.sdk.proxy.metadata_slug import assemble_routing_metadata, build_proxied_base_url
-from rllm.types import Trajectory
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# NPU operator mock (align with openhands-npu bring-up)
+# Config from environment
 # ---------------------------------------------------------------------------
 
-# Workspace package (Docker build context) — seeded into temp dir for operator tasks.
+_OPENHANDS_IMAGE = os.environ.get("OPENHANDS_IMAGE", "rllm-openhands")
+_MODEL_NAME = os.environ.get("OPENHANDS_MODEL_NAME", "openhands-model")
+_MAX_ITERATIONS = int(os.environ.get("OPENHANDS_MAX_ITERATIONS", "30"))
+_CONTAINER_TIMEOUT = int(os.environ.get("OPENHANDS_CONTAINER_TIMEOUT", "600"))
+_ARTIFACT_DIR = os.environ.get("OPENHANDS_ARTIFACT_DIR", "")
+_OPENHANDS_MOCK_PIPELINE = os.environ.get("OPENHANDS_MOCK_PIPELINE", "0") == "1"
+
+# ---------------------------------------------------------------------------
+# NPU operator workspace setup
+# ---------------------------------------------------------------------------
+
 _SDK_DIR = os.path.dirname(os.path.abspath(__file__))
 _WORKSPACE_PKG = os.path.join(_SDK_DIR, "workspace")
 _OPERATOR_SEED_NAMES = (
@@ -61,45 +71,121 @@ _OPERATOR_SEED_NAMES = (
     ".agents",
     "tools",
     "src",
-    "refs",
 )
 
 
-def _chmod_executable_scripts(tools_dir: str) -> None:
-    if not os.path.isdir(tools_dir):
-        return
-    for name in os.listdir(tools_dir):
-        path = os.path.join(tools_dir, name)
-        if os.path.isfile(path) and (name.endswith(".sh") or name.endswith(".py")):
-            try:
-                os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-            except OSError:
-                pass
+def _chmod_executable_scripts(directory: str) -> None:
+    """Recursively set +x on .sh and .py files under *directory*."""
+    for root, _, files in os.walk(directory):
+        for name in files:
+            if name.endswith((".sh", ".py")):
+                path = os.path.join(root, name)
+                try:
+                    os.chmod(
+                        path,
+                        os.stat(path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH,
+                    )
+                except OSError:
+                    pass
 
 
-_NPU_INSTRUCTION_TEMPLATE = """# NPU / 算子任务
+# ---------------------------------------------------------------------------
+# Mock pipeline (bring-up testing without real NPU)
+#
+# When OPENHANDS_MOCK_PIPELINE=1, this script **replaces**
+# tools/operator_pipeline.sh in the temp workspace.  The interface
+# (--op_name flag, metrics.json output schema) is identical to the real
+# pipeline, so INSTRUCTIONS.md and reward logic work unchanged.
+# ---------------------------------------------------------------------------
 
-{instruction}
+_MOCK_PIPELINE_SCRIPT = r"""#!/bin/bash
+# Mock operator pipeline — drop-in replacement for operator_pipeline.sh.
+# Performs Python syntax + ModelNew class check; outputs metrics.json
+# with randomised speedup. No NPU or torch_npu required.
+set -euo pipefail
 
-## 要求
+OP_NAME="operator"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --op_name) OP_NAME="$2"; shift 2;;
+        *) shift;;
+    esac
+done
 
-1. 阅读 `AGENTS.md`，在 `INSTRUCTIONS.md` 指定路径实现算子（默认：`src/triton/operator.py` 或 `src/ascendc/kernel.cpp`，取决于后端）。
-2. **不要修改** `tools/`。编译与评测一律通过 conda 封装脚本（内部已处理环境）：
-   ```bash
-   bash /opt/workspace/tools/operator_pipeline.sh
-   ```
-3. 检查根目录 `metrics.json` 与 `profiling_results.json`，直至 `"success": true`。
-4. 失败时根据终端输出与 JSON 中的 `error` 字段修复并重新运行流水线。
+IMPL="src/${OP_NAME}_triton_ascend_impl.py"
+M="metrics.json"
+
+if [ ! -f "$IMPL" ]; then
+    printf '{"success":false,"error":"File not found: %s","ast_check_ok":false,"correctness_ok":false}\n' "$IMPL" > "$M"
+    echo "[mock] FAIL: $IMPL not found"; exit 0
+fi
+
+# Python syntax check
+if ! python3 -c "import ast; ast.parse(open('${IMPL}').read())" 2>/dev/null; then
+    printf '{"success":false,"error":"Syntax error in %s","ast_check_ok":false,"correctness_ok":false}\n' "$IMPL" > "$M"
+    echo "[mock] FAIL: syntax error"; exit 0
+fi
+
+# ModelNew class check
+if ! python3 -c "
+import ast
+tree = ast.parse(open('${IMPL}').read())
+assert any(n.name == 'ModelNew' for n in ast.walk(tree) if isinstance(n, ast.ClassDef))
+" 2>/dev/null; then
+    printf '{"success":false,"error":"ModelNew class not found in %s","ast_check_ok":true,"correctness_ok":false}\n' "$IMPL" > "$M"
+    echo "[mock] FAIL: ModelNew not found"; exit 0
+fi
+
+# Mock success with random speedup
+SP=$(python3 -c "import random; print(f'{random.uniform(0.8, 2.0):.2f}')")
+TL=$(python3 -c "print(f'{1.0/float(${SP}):.4f}')")
+cat > "$M" <<EOFM
+{
+  "success": true,
+  "ast_check_ok": true,
+  "correctness_ok": true,
+  "perf_data": {"speedup_vs_torch": ${SP}, "torch_latency_ms": 1.0, "triton_latency_ms": ${TL}},
+  "error": null
+}
+EOFM
+echo "[mock] OK: speedup=${SP}x"
 """
 
 
-def _is_npu_operator_task(task: dict[str, Any]) -> bool:
-    return task.get("scenario") == "npu_operator" or task.get("task_type") == "npu_operator"
+# ---------------------------------------------------------------------------
+# Instruction template
+# ---------------------------------------------------------------------------
+
+_NPU_INSTRUCTION_TEMPLATE = """# 当前任务
+
+- 算子名称: **{op_name}**
+- 目标架构: **{arch}**
+
+{instruction}
+
+## 任务格式（KernelBench）
+
+任务文件: `src/{op_name}.py`（包含 `Model`、`get_inputs()`、`get_init_inputs()`）。
+
+## 要求
+
+1. 阅读 `AGENTS.md` 了解全局约定和工作流。
+2. 在 `src/{op_name}_triton_ascend_impl.py` 中实现 `ModelNew` 类。
+3. 运行验证流水线：
+   ```bash
+   bash tools/operator_pipeline.sh --op_name {op_name}
+   ```
+4. 读取 `metrics.json`，根据 `error` 字段修复并重试，直至 `"success": true`。
+"""
 
 
 def _setup_npu_operator_workspace(task: dict[str, Any]) -> str:
     workspace = tempfile.mkdtemp(prefix=f"openhands-npu-{uuid.uuid4().hex[:8]}-")
+    op_name = task.get("op_name", "operator")
+    arch = task.get("arch", "ascend910b1")
     instruction = task.get("instruction", "Implement a simple vector_add-style operator.")
+    task_code = task.get("task_code", "")
+
     for name in _OPERATOR_SEED_NAMES:
         src = os.path.join(_WORKSPACE_PKG, name)
         dst = os.path.join(workspace, name)
@@ -110,73 +196,155 @@ def _setup_npu_operator_workspace(task: dict[str, Any]) -> str:
         else:
             shutil.copy2(src, dst)
     _chmod_executable_scripts(os.path.join(workspace, "tools"))
+
+    if _OPENHANDS_MOCK_PIPELINE:
+        mock_path = os.path.join(workspace, "tools", "operator_pipeline.sh")
+        with open(mock_path, "w") as f:
+            f.write(_MOCK_PIPELINE_SCRIPT)
+        os.chmod(mock_path, 0o755)
+
     with open(os.path.join(workspace, "INSTRUCTIONS.md"), "w") as f:
-        f.write(_NPU_INSTRUCTION_TEMPLATE.format(instruction=instruction))
+        f.write(_NPU_INSTRUCTION_TEMPLATE.format(op_name=op_name, arch=arch, instruction=instruction))
+
+    if task_code:
+        src_dir = os.path.join(workspace, "src")
+        os.makedirs(src_dir, exist_ok=True)
+        with open(os.path.join(src_dir, f"{op_name}.py"), "w") as f:
+            f.write(task_code)
+
     return workspace
 
 
-def _npu_operator_reward(task: dict[str, Any], workspace_dir: str, output: str) -> float:
-    del output  # optional hooks for logging extensions
-    triton_py = os.path.join(workspace_dir, "src", "triton", "operator.py")
-    ascend_cpp = os.path.join(workspace_dir, "src", "ascendc", "kernel.cpp")
-    legacy_cpp = os.path.join(workspace_dir, "kernel.cpp")
-    has_impl = any(os.path.exists(p) for p in (triton_py, ascend_cpp, legacy_cpp))
-    if not has_impl:
-        logger.info("[openhands-npu] no operator source found -> reward=0.0")
-        return 0.0
+# ---------------------------------------------------------------------------
+# Metrics & reward
+# ---------------------------------------------------------------------------
 
-    metrics_path = os.path.join(workspace_dir, "metrics.json")
-    profiler_json = os.path.join(workspace_dir, "profiling_results.json")
-    perf: dict[str, Any] | None = None
-    if os.path.exists(metrics_path):
+def _load_metrics(workspace_dir: str) -> dict[str, Any] | None:
+    path = os.path.join(workspace_dir, "metrics.json")
+    if os.path.exists(path):
         try:
-            with open(metrics_path) as f:
-                perf = json.load(f)
+            with open(path) as f:
+                return json.load(f)
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("[openhands-npu] bad metrics.json: %s", exc)
-    if perf is None and os.path.exists(profiler_json):
-        try:
-            with open(profiler_json) as f:
-                perf = json.load(f)
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("[openhands-npu] bad profiling_results.json: %s", exc)
+    return None
 
-    if not perf:
-        logger.info("[openhands-npu] implementation present, no metrics -> reward=0.2")
-        return 0.2
+
+def _reward_from_metrics(perf: dict[str, Any]) -> float:
     if not bool(perf.get("success", False)):
-        logger.info("[openhands-npu] metrics report failure -> reward=0.2")
+        ast_ok = bool(perf.get("ast_check_ok", False))
+        corr_ok = bool(perf.get("correctness_ok", False))
+        if corr_ok:
+            return 0.4
+        elif ast_ok:
+            return 0.3
         return 0.2
+
+    perf_data = perf.get("perf_data") or {}
+    speedup = float(perf_data.get("speedup_vs_torch", 1.0))
+    return min(0.5 + 0.5 * (speedup / 2.0), 1.0)
+
+
+def _npu_operator_reward(task: dict[str, Any], workspace_dir: str, output: str) -> float:
+    del output
+    op_name = task.get("op_name", "operator")
+
+    impl_file = os.path.join(workspace_dir, "src", f"{op_name}_triton_ascend_impl.py")
+    if not os.path.exists(impl_file):
+        logger.info("[openhands-npu] no impl file %s -> reward=0.0", impl_file)
+        return 0.0
+
+    # TODO: consider rejecting empty/stub-only impl files (os.path.getsize check)
+
+    perf = _load_metrics(workspace_dir)
+    if not perf:
+        logger.info("[openhands-npu] impl present but no metrics -> reward=0.2")
+        return 0.2
+
+    reward = _reward_from_metrics(perf)
+
+    best_path = os.path.join(workspace_dir, "metrics_best.json")
+    if os.path.exists(best_path):
+        try:
+            with open(best_path) as f:
+                best = json.load(f)
+            best_reward = _reward_from_metrics(best)
+            if best_reward > reward:
+                logger.info(
+                    "[openhands-npu] best version has higher reward: "
+                    "current=%.3f best=%.3f -> using best",
+                    reward, best_reward,
+                )
+                reward = best_reward
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    logger.info("[openhands-npu] final reward=%.3f", reward)
+    return reward
+
+
+def _archive_npu_artifacts(
+    workspace_dir: str,
+    task: dict[str, Any],
+    trace_label: str,
+    reward: float,
+) -> None:
+    """Copy key rollout artifacts to a persistent directory before cleanup.
+
+    Controlled by env OPENHANDS_ARTIFACT_DIR. No-op if unset/empty.
+    Never raises — archival failure must not affect training.
+    """
+    if not _ARTIFACT_DIR:
+        return
+    if not os.path.isdir(workspace_dir):
+        return
+
+    op_name = task.get("op_name", "operator")
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    short_id = uuid.uuid4().hex[:6]
+    dest = os.path.join(_ARTIFACT_DIR, f"{trace_label}_{op_name}_{ts}_{short_id}")
+
     try:
-        bandwidth = float(perf.get("bandwidth_gbps", 0.0))
-        theoretical_peak = float(task.get("theoretical_peak_gbps", 1200.0))
-        if theoretical_peak <= 0:
-            theoretical_peak = 1200.0
-        optimization_ratio = min(bandwidth / theoretical_peak, 1.0)
-        reward = 0.5 + 0.5 * optimization_ratio
-        logger.info("[openhands-npu] success bandwidth=%.1f GB/s reward=%.3f", bandwidth, reward)
-        return reward
-    except (ValueError, TypeError) as exc:
-        logger.warning("[openhands-npu] bad bandwidth in metrics: %s", exc)
-        return 0.1
+        os.makedirs(dest, exist_ok=True)
+
+        candidates = [
+            (os.path.join(workspace_dir, "src", f"{op_name}_triton_ascend_impl.py"),
+             f"{op_name}_triton_ascend_impl.py"),
+            (os.path.join(workspace_dir, "src", f"{op_name}_triton_ascend_impl_best.py"),
+             f"{op_name}_triton_ascend_impl_best.py"),
+            (os.path.join(workspace_dir, "metrics.json"), "metrics.json"),
+            (os.path.join(workspace_dir, "metrics_best.json"), "metrics_best.json"),
+            (os.path.join(workspace_dir, "INSTRUCTIONS.md"), "INSTRUCTIONS.md"),
+        ]
+
+        copied = 0
+        for src_path, dst_name in candidates:
+            if os.path.isfile(src_path):
+                shutil.copy2(src_path, os.path.join(dest, dst_name))
+                copied += 1
+
+        manifest = {
+            "trace_label": trace_label,
+            "op_name": op_name,
+            "arch": task.get("arch", "ascend910b1"),
+            "reward": reward,
+            "timestamp": ts,
+        }
+        with open(os.path.join(dest, "manifest.json"), "w") as f:
+            json.dump(manifest, f, indent=2)
+
+        if copied == 0:
+            shutil.rmtree(dest, ignore_errors=True)
+            logger.debug("[openhands] No artifacts to archive for trace=%s", trace_label)
+        else:
+            logger.info("[openhands] Archived %d artifacts → %s (reward=%.3f)", copied, dest, reward)
+    except Exception:
+        logger.warning("[openhands] Failed to archive artifacts for trace=%s", trace_label, exc_info=True)
 
 
 # ---------------------------------------------------------------------------
-# Config from environment
+# LiteLLM metadata slug
 # ---------------------------------------------------------------------------
-
-# Custom image built from workspace/Dockerfile (based on official OpenHands
-# image but with workspace/entrypoint.py pre-installed as ENTRYPOINT).
-_OPENHANDS_IMAGE = os.environ.get("OPENHANDS_IMAGE", "rllm-openhands")
-_MODEL_NAME = os.environ.get("OPENHANDS_MODEL_NAME", "openai/openhands-model")
-_MAX_ITERATIONS = int(os.environ.get("OPENHANDS_MAX_ITERATIONS", "30"))
-_CONTAINER_TIMEOUT = int(os.environ.get("OPENHANDS_CONTAINER_TIMEOUT", "600"))
-
-
-# ---------------------------------------------------------------------------
-# LiteLLM metadata slug (rllm.sdk.proxy.metadata_slug)
-# ---------------------------------------------------------------------------
-
 
 def _trace_label_from_routing_metadata(metadata: dict[str, Any]) -> str:
     uids = metadata.get("session_uids") or []
@@ -186,22 +354,8 @@ def _trace_label_from_routing_metadata(metadata: dict[str, Any]) -> str:
     return str(name or "none")[:18]
 
 
-def _routing_metadata_for_rollout(
-    explicit_uids: list[str] | None,
-    explicit_name: str | None,
-) -> dict[str, Any]:
-    """Slug payload: ``assemble_routing_metadata`` + optional ``_rllm_proxy_session_*`` overrides."""
-    extra: dict[str, Any] = {}
-    if explicit_uids is not None:
-        extra["session_uids"] = list(explicit_uids)
-    if explicit_name is not None:
-        extra["session_name"] = explicit_name
-    return assemble_routing_metadata(extra=extra if extra else None)
-
-
 def _to_container_url(url: str) -> str:
-    """Replace localhost/127.0.0.1 with host.docker.internal so the URL
-    is reachable from inside an OpenHands Docker container."""
+    """Replace localhost/127.0.0.1 with host.docker.internal for Docker access."""
     parsed = urlparse(url)
     host = parsed.hostname or ""
     if host in ("localhost", "127.0.0.1"):
@@ -211,117 +365,44 @@ def _to_container_url(url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Workspace helpers
-# ---------------------------------------------------------------------------
-
-def _setup_workspace(task: dict[str, Any]) -> str:
-    if _is_npu_operator_task(task):
-        return _setup_npu_operator_workspace(task)
-    workspace = tempfile.mkdtemp(prefix=f"openhands-{uuid.uuid4().hex[:8]}-")
-    repo_url = task.get("repo_url")
-    if repo_url:
-        subprocess.run(
-            ["git", "clone", "--depth=1", repo_url, workspace],
-            check=True, capture_output=True, timeout=120,
-        )
-    instruction = task.get("instruction", "Fix the bug in the repository.")
-    with open(os.path.join(workspace, "INSTRUCTIONS.md"), "w") as f:
-        f.write(f"# Task\n\n{instruction}\n")
-    return workspace
-
-
-# ---------------------------------------------------------------------------
-# Reward evaluation
-# ---------------------------------------------------------------------------
-
-def _default_reward(task: dict[str, Any], workspace_dir: str, output: str) -> float:
-    if _is_npu_operator_task(task):
-        return _npu_operator_reward(task, workspace_dir, output)
-    test_target = task.get("test_file") or task.get("test_dir")
-    if test_target:
-        test_path = os.path.join(workspace_dir, test_target)
-        if os.path.exists(test_path):
-            try:
-                result = subprocess.run(
-                    ["python", "-m", "pytest", test_path, "-x", "-q", "--tb=no"],
-                    capture_output=True, cwd=workspace_dir, timeout=60,
-                )
-                return 1.0 if result.returncode == 0 else 0.0
-            except subprocess.TimeoutExpired:
-                return 0.0
-
-    success_keywords = task.get("success_keywords", [])
-    if success_keywords:
-        if any(kw.lower() in output.lower() for kw in success_keywords):
-            return 1.0
-
-    logger.warning("[openhands] No evaluation criteria in task; reward=0.0")
-    return 0.0
-
-
-# ---------------------------------------------------------------------------
 # OpenHands container launch
 # ---------------------------------------------------------------------------
 
 def _run_openhands_container(
     workspace: str,
     proxied_url: str,
-    instruction: str,
     *,
-    npu_operator: bool = False,
-    operator_backend: str = "triton",
+    task: dict[str, Any] | None = None,
 ) -> str:
-    """Start an OpenHands headless container, wait for completion, return logs.
-
-    Args:
-        workspace:    Host-side workspace directory (mounted into container).
-        proxied_url:  LiteLLM proxy URL with embedded rllm metadata slug.
-                      Passed as LLM_BASE_URL so rllm can track all LLM calls.
-        instruction:  Task instruction (also written to INSTRUCTIONS.md).
-    """
+    """Start an OpenHands headless container, wait for completion, return logs."""
+    task = task or {}
     container_name = f"rllm-openhands-{uuid.uuid4().hex[:12]}"
+    op_name = task.get("op_name", "operator")
+    arch = task.get("arch", "ascend910b1")
+    operator_backend = str(task.get("operator_backend", "triton"))
 
     cmd = [
         "docker", "run",
         "--rm",
         "--name", container_name,
-
-        # --- LLM routing ---
-        # proxied_url carries the rllm metadata slug so every LLM call made
-        # by OpenHands SDK (via workspace/entrypoint.py) is attributed to
-        # this training session by the rllm LiteLLM proxy.
         "-e", f"LLM_BASE_URL={proxied_url}",
         "-e", "LLM_API_KEY=EMPTY",
-        "-e", f"LLM_MODEL={_MODEL_NAME}",
-        "-e", f"NPU_OPERATOR_TASK={'1' if npu_operator else '0'}",
-    ]
-    if npu_operator:
-        cmd.extend(["-e", f"OPERATOR_BACKEND={operator_backend}"])
-    if not npu_operator:
-        cmd.extend(["-e", f"TASK_INSTRUCTION={instruction}"])
-
-    cmd.extend(
-        [
-        # --- Workspace ---
-        # The host workspace dir is mounted; the agent operates directly
-        # inside the container — no inner sandbox is created.
+        "-e", f"LLM_MODEL=openai/{_MODEL_NAME}",
+        "-e", f"OPERATOR_BACKEND={operator_backend}",
+        "-e", f"OPERATOR_ARCH={arch}",
+        "-e", f"OPERATOR_NAME={op_name}",
+        "-e", "http_proxy=",
+        "-e", "https_proxy=",
+        "-e", "no_proxy=host.docker.internal,127.0.0.1,localhost,172.17.0.1",
         "-e", "WORKSPACE_BASE=/opt/workspace",
         "-v", f"{workspace}:/opt/workspace",
-
-        # --- Agent iterations ---
+        "-v", f"{_WORKSPACE_PKG}/entrypoint.py:/app/rllm_entrypoint.py:ro",
+        "--entrypoint", "python",
         "-e", f"MAX_ITERATIONS={_MAX_ITERATIONS}",
-
-        # --- Network ---
-        # host.docker.internal resolves to the training host so the agent
-        # can reach the LiteLLM proxy.
         "--add-host", "host.docker.internal:host-gateway",
-
-        # Custom image built from workspace/Dockerfile.
-        # ENTRYPOINT = workspace/entrypoint.py (new OpenHands SDK).
-        # No docker.sock mount needed — no inner sandbox.
         _OPENHANDS_IMAGE,
-        ]
-    )
+        "/app/rllm_entrypoint.py",
+    ]
 
     logger.info(
         "[openhands] Launching container %s (image=%s, proxied_url=%s...)",
@@ -354,16 +435,11 @@ def _run_openhands_container(
 # Rollout entry point
 # ---------------------------------------------------------------------------
 
-# Keys passed through AgentSdkEngine / session wrapper as kwargs alongside
-# extra_info fields; they must not be treated as task payload.
 _ROLLOUT_CONFIG_KEYS = frozenset({
     "config",
     "base_url",
     "session_uid",
     "is_validation",
-    # Set by rllm.sdk.session.wrap_with_session_context (rllm ≥ patched)
-    "_rllm_proxy_session_uids",
-    "_rllm_proxy_session_name",
 })
 
 
@@ -396,35 +472,22 @@ def _rollout_task_and_config(
     return task, config
 
 
-def rollout(*args: Any, **kwargs: Any) -> list[dict]:
-    """rllm rollout entry point for OpenHands.
+def rollout(*args: Any, **kwargs: Any) -> float:
+    """rllm rollout entry point — NPU operator generation.
 
     Generates a session-specific metadata slug, builds a proxied LiteLLM URL,
     and launches OpenHands in an isolated Docker container. All LLM calls made
     by OpenHands will carry the metadata slug so the rllm proxy can attribute
     them to this training session.
 
-    Compatible with:
-
-    - ``AgentSdkEngine`` (task fields as keyword args from ``extra_info``).
-    - Legacy ``rollout(task_dict, config_dict)``.
-
-    Config may include ``base_url`` (LiteLLM proxy, e.g. ``http://127.0.0.1:4000/v1``).
-
     Returns:
-        List of one ``rllm.types.Trajectory`` (required by ``AgentSdkEngine``).
+        Scalar reward (float).
     """
-    slug_uids = kwargs.get("_rllm_proxy_session_uids")
-    slug_name = kwargs.get("_rllm_proxy_session_name")
-    if slug_uids is not None and not isinstance(slug_uids, list):
-        slug_uids = list(slug_uids) if slug_uids else None
-
     task, config = _rollout_task_and_config(args, kwargs)
 
-    # Raw proxy URL — rllm passes this before any slug is applied
     proxy_url = config.get("base_url", "http://127.0.0.1:4000/v1")
 
-    metadata = _routing_metadata_for_rollout(slug_uids, slug_name)
+    metadata = assemble_routing_metadata()
     trace_label = _trace_label_from_routing_metadata(metadata)
     _uids = metadata.get("session_uids") or []
     logger.info(
@@ -435,25 +498,15 @@ def rollout(*args: Any, **kwargs: Any) -> list[dict]:
     )
 
     proxied_url = build_proxied_base_url(proxy_url, metadata)
-
-    # Rewrite localhost/127.0.0.1 → host.docker.internal so the URL is
-    # reachable from inside the OpenHands Docker container.
     proxied_url = _to_container_url(proxied_url)
 
-    npu = _is_npu_operator_task(task)
-    workspace = _setup_workspace(task)
-    instruction = task.get("instruction", "Fix the bug in the repository.")
+    workspace = _setup_npu_operator_workspace(task)
+    instruction = task.get("instruction", "")
     reward = 0.0
 
     try:
-        output = _run_openhands_container(
-            workspace,
-            proxied_url,
-            instruction,
-            npu_operator=npu,
-            operator_backend=str(task.get("operator_backend", "triton")),
-        )
-        reward = _default_reward(task, workspace, output)
+        output = _run_openhands_container(workspace, proxied_url, task=task)
+        reward = _npu_operator_reward(task, workspace, output)
         logger.info(
             "[openhands] trace=%s reward=%.2f instruction=%s",
             trace_label, reward, instruction[:80],
@@ -461,14 +514,7 @@ def rollout(*args: Any, **kwargs: Any) -> list[dict]:
     except Exception:
         logger.exception("[openhands] Rollout failed (trace=%s)", trace_label)
     finally:
+        _archive_npu_artifacts(workspace, task, trace_label, reward)
         shutil.rmtree(workspace, ignore_errors=True)
 
-    # AgentSdkEngine requires list[rllm.types.Trajectory], not plain dicts.
-    return [
-        Trajectory(
-            name="openhands",
-            steps=[],
-            reward=reward,
-            metadata={"trace_label": trace_label},
-        )
-    ]
+    return reward

@@ -10,11 +10,11 @@ Configuration via environment variables (set by openhands_agent.py):
     LLM_BASE_URL        Proxied rllm LiteLLM URL with embedded metadata slug.
     LLM_API_KEY         API key for the proxy (default: EMPTY)
     LLM_MODEL           Model name on the LiteLLM proxy
-    TASK_INSTRUCTION    Task text; falls back to reading INSTRUCTIONS.md
     WORKSPACE_BASE      Workspace directory (default: /opt/workspace)
     MAX_ITERATIONS      Max agent iterations (default: 30)
-    NPU_OPERATOR_TASK   1 = operator / kernel task
     OPERATOR_BACKEND    triton (default)
+    OPERATOR_ARCH       Target NPU architecture (default: ascend910b1)
+    OPERATOR_NAME       Operator name from task data (default: operator)
 
 Exit codes:
     0   Completed
@@ -72,7 +72,8 @@ LLM_API_KEY: str = os.environ.get("LLM_API_KEY", "EMPTY")
 LLM_MODEL: str = os.environ.get("LLM_MODEL", "openai/openhands-model")
 WORKSPACE_BASE: str = os.environ.get("WORKSPACE_BASE", "/opt/workspace")
 MAX_ITERATIONS: int = int(os.environ.get("MAX_ITERATIONS", "30"))
-NPU_OPERATOR_TASK: bool = os.environ.get("NPU_OPERATOR_TASK", "0") in ("1", "true", "True", "yes")
+OPERATOR_ARCH: str = os.environ.get("OPERATOR_ARCH", "ascend910b1")
+OPERATOR_NAME: str = os.environ.get("OPERATOR_NAME", "operator")
 
 TASK_INSTRUCTION: str = os.environ.get("TASK_INSTRUCTION", "")
 if not TASK_INSTRUCTION:
@@ -113,22 +114,15 @@ llm = LLM(
     max_output_tokens=4096,
 )
 
-if NPU_OPERATOR_TASK:
-    _task_scope = (
-        "You are a Triton-Ascend kernel generation agent. "
-        "Follow AGENTS.md and INSTRUCTIONS.md strictly. "
-        "Implement ModelNew with @triton.jit kernels in src/{op_name}_triton_ascend_impl.py. "
-        "All core computation MUST be in Triton kernels — no PyTorch ops in forward(). "
-        "Do NOT modify tools/. Verify by running: bash tools/operator_pipeline.sh --op_name <op_name>. "
-        "Iterate until metrics.json reports success. Summarize results when done."
-    )
-else:
-    _task_scope = (
-        "You are a software engineering agent. "
-        "Complete the task described in the TASK section. "
-        "Work inside the provided workspace directory. "
-        "When done, summarize what you accomplished."
-    )
+_task_scope = (
+    "You are a Triton-Ascend kernel generation agent. "
+    f"Target architecture: {OPERATOR_ARCH}. "
+    "Follow AGENTS.md and INSTRUCTIONS.md strictly. "
+    f"Implement ModelNew with @triton.jit kernels in src/{OPERATOR_NAME}_triton_ascend_impl.py. "
+    "All core computation MUST be in Triton kernels — no PyTorch ops in forward(). "
+    f"Do NOT modify tools/. Verify by running: bash tools/operator_pipeline.sh --op_name {OPERATOR_NAME}. "
+    "Iterate until metrics.json reports success. Summarize results when done."
+)
 
 _task_skill = Skill(
     name="task_scope",

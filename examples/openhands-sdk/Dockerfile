@@ -1,5 +1,5 @@
 # =============================================================================
-# Dockerfile for the rllm sandbox worker container (examples/openhands-sdk)
+# Dockerfile for the rllm sandbox worker container (examples/openhands_sdk)
 #
 # This container is managed by rllm's SandboxOrchestrator / DockerSandbox.
 # It runs worker_server.py and the openhands_agent.py rollout function.
@@ -17,7 +17,7 @@
 #
 # Build:
 #   docker build -t rllm-openhands-sandbox \
-#       -f examples/openhands-sdk/Dockerfile .
+#       -f examples/openhands_sdk/Dockerfile .
 # =============================================================================
 
 FROM python:3.11-slim
