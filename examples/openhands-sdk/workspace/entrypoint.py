@@ -4,7 +4,6 @@ rllm OpenHands entrypoint — runs inside the OpenHands Docker container.
 
 Launched by openhands_agent.py (rllm side) via ``docker run``.
 Uses the new OpenHands Python SDK (LLM, Agent, Conversation, Tool) directly.
-No inner sandbox is created — the container itself IS the execution environment.
 
 Configuration via environment variables (set by openhands_agent.py):
 
@@ -14,8 +13,8 @@ Configuration via environment variables (set by openhands_agent.py):
     TASK_INSTRUCTION    Task text; falls back to reading INSTRUCTIONS.md
     WORKSPACE_BASE      Workspace directory (default: /opt/workspace)
     MAX_ITERATIONS      Max agent iterations (default: 30)
-    NPU_OPERATOR_TASK   1 = operator / kernel task prompt
-    OPERATOR_BACKEND    triton | ascendc (for task_scope hint)
+    NPU_OPERATOR_TASK   1 = operator / kernel task
+    OPERATOR_BACKEND    triton (default)
 
 Exit codes:
     0   Completed
@@ -39,10 +38,6 @@ from openhands.tools.terminal import TerminalTool
 
 logger = get_logger(__name__)
 
-# ---------------------------------------------------------------------------
-# Hardcoded short system prompt (replaces SDK default system_prompt.j2)
-# ---------------------------------------------------------------------------
-
 _HARDCODED_SYSTEM_PROMPT_J2 = """You are a helpful assistant. Use the provided tools to complete the task. Be concise.
 """
 
@@ -50,7 +45,7 @@ _MINIMAL_SYSTEM_J2_PATH = "/tmp/rllm_minimal_system.j2"
 
 
 def merge_workspace_skills(workspace_base: str, task_scope: Skill) -> list:
-    """Merge AGENTS.md / .agents/skills with inline task_scope (see merge_skills_example.py)."""
+    """Merge AGENTS.md + .agents/skills/* + inline task_scope."""
     ws = Path(workspace_base)
     skills: list = []
 
@@ -69,7 +64,7 @@ def merge_workspace_skills(workspace_base: str, task_scope: Skill) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Read configuration from environment
+# Configuration
 # ---------------------------------------------------------------------------
 
 LLM_BASE_URL: str = os.environ.get("LLM_BASE_URL", "")
@@ -78,7 +73,6 @@ LLM_MODEL: str = os.environ.get("LLM_MODEL", "openai/openhands-model")
 WORKSPACE_BASE: str = os.environ.get("WORKSPACE_BASE", "/opt/workspace")
 MAX_ITERATIONS: int = int(os.environ.get("MAX_ITERATIONS", "30"))
 NPU_OPERATOR_TASK: bool = os.environ.get("NPU_OPERATOR_TASK", "0") in ("1", "true", "True", "yes")
-OPERATOR_BACKEND: str = os.environ.get("OPERATOR_BACKEND", "triton")
 
 TASK_INSTRUCTION: str = os.environ.get("TASK_INSTRUCTION", "")
 if not TASK_INSTRUCTION:
@@ -108,7 +102,7 @@ logger.info("TASK         : %.120s", TASK_INSTRUCTION)
 
 
 # ---------------------------------------------------------------------------
-# Build OpenHands SDK objects
+# Build SDK objects
 # ---------------------------------------------------------------------------
 
 llm = LLM(
@@ -121,10 +115,12 @@ llm = LLM(
 
 if NPU_OPERATOR_TASK:
     _task_scope = (
-        f"You are a custom kernel / operator agent (backend hint: {OPERATOR_BACKEND}). "
-        "Follow AGENTS.md and INSTRUCTIONS.md. Implement under src/triton/ or src/ascendc/ as directed. "
-        "Do not modify tools/. Run `bash tools/operator_pipeline.sh` after changes; "
-        "iterate until metrics.json reports success. Summarize results when done."
+        "You are a Triton-Ascend kernel generation agent. "
+        "Follow AGENTS.md and INSTRUCTIONS.md strictly. "
+        "Implement ModelNew with @triton.jit kernels in src/{op_name}_triton_ascend_impl.py. "
+        "All core computation MUST be in Triton kernels — no PyTorch ops in forward(). "
+        "Do NOT modify tools/. Verify by running: bash tools/operator_pipeline.sh --op_name <op_name>. "
+        "Iterate until metrics.json reports success. Summarize results when done."
     )
 else:
     _task_scope = (
