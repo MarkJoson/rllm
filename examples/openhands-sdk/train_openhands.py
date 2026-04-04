@@ -20,6 +20,8 @@ Run via train_openhands.sh or directly::
 
     export OPENHANDS_DATASET=mock_npu
     python3 -m examples.openhands_sdk.train_openhands ...
+
+自有 Parquet 字段约定见同目录 ``TRAINING_DATA.md``。
 """
 
 import os

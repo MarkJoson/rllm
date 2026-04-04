@@ -4,7 +4,7 @@
 #
 # Architecture:
 #   Host
-#   ├─ vLLM (GPU inference)
+#   ├─ vLLM (GPU inference)  # TODO(待替换): 纯 NPU 场景下改为实际推理栈说明（如 NPU 上 vLLM 或其它后端）
 #   ├─ LiteLLM proxy  (rllm metadata-slug proxy, port PROXY_PORT)
 #   └─ rllm training process (Ray workers)
 #        └─ rollout()  in openhands_agent.py
@@ -14,9 +14,10 @@
 #
 # Key knobs:
 #   MODEL_PATH          — base model (HuggingFace ID or local path)
-#   N_GPUS              — number of GPUs per node
+#   N_GPUS              — number of GPUs per node  # TODO(待替换): NPU 节点上多为卡数/设备数语义，与 trainer.device=npu 对齐命名习惯
 #   PROXY_PORT          — LiteLLM proxy port
 #   OPENHANDS_IMAGE     — OpenHands Docker image to run per rollout
+#   OPENHANDS_ASCEND_VISIBLE_DEVICES — 仅注入 OpenHands 容器：算子 verify/benchmark 可见的逻辑 NPU（逗号分隔），与训练侧设备隔离
 #   OPENHANDS_DATASET   — swe (default) | mock_npu  (算子 bring-up：mock parquet + profiling mock)
 # ==============================================================================
 set -euo pipefail
@@ -42,20 +43,25 @@ export HYDRA_FULL_ERROR=1
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 
 # ------------------------------------------------------------------------------
+# TODO(待替换): 整段为 CUDA + vLLM 环境模板；以 NPU 为主训练时请改为 Ascend/CANN 要求或删除无效项。
 # vLLM / CUDA
-# TODO: 以下 CUDA/vLLM 环境变量需要根据实际硬件平台（NPU/GPU）调整
 # ------------------------------------------------------------------------------
-export VLLM_ATTENTION_BACKEND="TORCH_SDPA"
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False"
-export VLLM_USE_V1=1
-export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
-export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export VLLM_ATTENTION_BACKEND="TORCH_SDPA"                      # TODO(待替换)
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False"   # TODO(待替换): CUDA 显存配置
+export VLLM_USE_V1=1                                            # TODO(待替换)
+export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1                        # TODO(待替换)
+export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000          # TODO(待替换)
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7                   # TODO(待替换): 训练侧设备隔离请用 ASCEND_RT_VISIBLE_DEVICES 等
 
 # ------------------------------------------------------------------------------
 # OpenHands container settings
 # (read by openhands_agent.py → forwarded into each OpenHands container)
 # ------------------------------------------------------------------------------
+# 算子验证容器内 NPU 可见性（写入容器环境变量 ASCEND_RT_VISIBLE_DEVICES）。
+# 留空则不注入，由镜像/宿主机默认行为决定。训练进程请单独用 ASCEND_RT_VISIBLE_DEVICES 等区分卡，勿与此混用同一含义。
+# 示例：专用最后一张卡给 agent — export OPENHANDS_ASCEND_VISIBLE_DEVICES=7
+export OPENHANDS_ASCEND_VISIBLE_DEVICES="${OPENHANDS_ASCEND_VISIBLE_DEVICES:-}"
+
 export OPENHANDS_MODEL_NAME="${OPENHANDS_MODEL_NAME:-/home/g00841271/Qwen3-8B}"
 export OPENHANDS_MAX_ITERATIONS="${OPENHANDS_MAX_ITERATIONS:-2}"
 export OPENHANDS_CONTAINER_TIMEOUT="${OPENHANDS_CONTAINER_TIMEOUT:-600}"
@@ -64,6 +70,7 @@ export OPENHANDS_CONTAINER_TIMEOUT="${OPENHANDS_CONTAINER_TIMEOUT:-600}"
 # Training parameters
 # ------------------------------------------------------------------------------
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen2.5-7B-Instruct}"
+# TODO(待替换): N_GPUS 名称为历史 GPU 习惯；与 trainer.n_gpus_per_node 及 NPU 卡数一致即可，后续可改名避免误导
 N_GPUS="${N_GPUS:-8}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 PROXY_PORT="${PROXY_PORT:-4000}"
@@ -73,9 +80,10 @@ EXPERIMENT_NAME="${EXPERIMENT_NAME:-openhands-ppo}"
 
 echo "=== rllm + OpenHands (container-based) ==="
 echo "  Model           : ${MODEL_PATH}"
-echo "  GPUs            : ${N_GPUS}"
+echo "  N_GPUS (trainer) : ${N_GPUS}"
 echo "  Proxy port      : ${PROXY_PORT}"
 echo "  OpenHands image : ${OPENHANDS_IMAGE}"
+echo "  OH NPU (container ASCEND_RT_VISIBLE_DEVICES): ${OPENHANDS_ASCEND_VISIBLE_DEVICES:-<unset>}"
 echo "  Max iterations  : ${OPENHANDS_MAX_ITERATIONS}"
 
 echo "正在重启 Ray 集群清理 NPU 状态..."
@@ -94,6 +102,9 @@ ray start --head \
 # rollout() in openhands_agent.py runs directly in rllm Ray workers.
 # Each rollout spawns its own OpenHands Docker container via docker run.
 # No rllm sandbox (worker_server.py) wrapper is used.
+#
+# TODO(待替换): 以下 Hydra 参数中 rollout.name=vllm、engine_kwargs.vllm、gpu_memory_utilization、
+# *_per_gpu、trainer.n_gpus_per_node 等均为 CUDA/vLLM 历史模板；请按 rLLM + NPU 官方示例替换键名与取值。
 # ------------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 python3 "${SCRIPT_DIR}/train_openhands.py" \

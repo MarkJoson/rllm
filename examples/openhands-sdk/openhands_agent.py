@@ -28,6 +28,10 @@ Environment Variables:
     OPENHANDS_ARTIFACT_DIR      : Persistent directory for archiving rollout
                                   artifacts. Empty to disable (default).
     OPENHANDS_MOCK_PIPELINE     : "1" to use mock operator pipeline. Default: "0"
+    OPENHANDS_ASCEND_VISIBLE_DEVICES : Optional comma-separated logical NPU IDs passed
+        into the OpenHands container as ``ASCEND_RT_VISIBLE_DEVICES`` (verify/benchmark
+        only see these devices). Empty = do not set (inherit container default). Set
+        via ``train_openhands.sh`` to isolate from training without changing host env.
 """
 
 from __future__ import annotations
@@ -58,6 +62,7 @@ _MAX_ITERATIONS = int(os.environ.get("OPENHANDS_MAX_ITERATIONS", "30"))
 _CONTAINER_TIMEOUT = int(os.environ.get("OPENHANDS_CONTAINER_TIMEOUT", "600"))
 _ARTIFACT_DIR = os.environ.get("OPENHANDS_ARTIFACT_DIR", "")
 _OPENHANDS_MOCK_PIPELINE = os.environ.get("OPENHANDS_MOCK_PIPELINE", "0") == "1"
+_OPENHANDS_ASCEND_VISIBLE_DEVICES = os.environ.get("OPENHANDS_ASCEND_VISIBLE_DEVICES", "").strip()
 
 # ---------------------------------------------------------------------------
 # NPU operator workspace setup
@@ -375,12 +380,18 @@ def _run_openhands_container(
     task: dict[str, Any] | None = None,
 ) -> str:
     """Start an OpenHands headless container, wait for completion, return logs."""
+    # TODO(遗留): 禁止 agent 外网（如误 apt）目前仅靠 workspace/AGENTS.md 软约束。若需硬隔离，在此
+    # 组装 docker cmd 时加入 --network（例如宿主机预先 docker network create --internal …），并验证
+    # 仍能访问 host.docker.internal 上的 LiteLLM；勿用 network=none 除非 LLM 不依赖宿主机 HTTP。
     task = task or {}
     container_name = f"rllm-openhands-{uuid.uuid4().hex[:12]}"
     op_name = task.get("op_name", "operator")
     arch = task.get("arch", "ascend910b1")
     operator_backend = str(task.get("operator_backend", "triton"))
 
+    # TODO(遗留): Ascend NPU 入容器所需的 docker --device / 额外 -v 挂载（如 /dev/davinci*、驱动相关路径）
+    # 待按 CANN 与所用基础镜像文档确定，并与 OPENHANDS_ASCEND_VISIBLE_DEVICES 一起在真机验证。
+    # 当前仅挂载 workspace、entrypoint 及注入 ASCEND_RT_VISIBLE_DEVICES（若设置）。
     cmd = [
         "docker", "run",
         "--rm",
@@ -391,6 +402,11 @@ def _run_openhands_container(
         "-e", f"OPERATOR_BACKEND={operator_backend}",
         "-e", f"OPERATOR_ARCH={arch}",
         "-e", f"OPERATOR_NAME={op_name}",
+    ]
+    if _OPENHANDS_ASCEND_VISIBLE_DEVICES:
+        cmd.extend(["-e", f"ASCEND_RT_VISIBLE_DEVICES={_OPENHANDS_ASCEND_VISIBLE_DEVICES}"])
+    cmd.extend(
+        [
         "-e", "http_proxy=",
         "-e", "https_proxy=",
         "-e", "no_proxy=host.docker.internal,127.0.0.1,localhost,172.17.0.1",
@@ -402,11 +418,15 @@ def _run_openhands_container(
         "--add-host", "host.docker.internal:host-gateway",
         _OPENHANDS_IMAGE,
         "/app/rllm_entrypoint.py",
-    ]
+        ]
+    )
 
     logger.info(
-        "[openhands] Launching container %s (image=%s, proxied_url=%s...)",
-        container_name, _OPENHANDS_IMAGE, proxied_url[:70],
+        "[openhands] Launching container %s (image=%s, ascend_visible=%r, proxied_url=%s...)",
+        container_name,
+        _OPENHANDS_IMAGE,
+        _OPENHANDS_ASCEND_VISIBLE_DEVICES or "(unset)",
+        proxied_url[:70],
     )
 
     try:

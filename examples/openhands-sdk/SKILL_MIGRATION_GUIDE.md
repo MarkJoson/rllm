@@ -59,7 +59,7 @@ triggers:
 
 Python 模块目录必须用**下划线**（`openhands_sdk`），否则无法 import。非 Python 目录（如 skill 名 `kernel-generator`）可以用连字符。
 
-在一个仓库中统一风格：若顶层目录已用下划线（如 `examples/openhands_sdk/`），则 Dockerfile 注释、脚本路径等也应保持一致，避免混用。
+在一个仓库中统一风格：若顶层目录已用下划线（如 `examples/openhands_sdk/`），则脚本与文档中的路径注释也应保持一致，避免混用 `openhands_sdk` / `openhands-sdk`。
 
 ---
 
@@ -252,8 +252,7 @@ host 侧 `_npu_operator_reward` 在当前 metrics 不佳时自动 fallback 到 `
 workspace/
 ├── AGENTS.md                          # 全局约定、Phase 工作流、错误分类
 ├── INSTRUCTIONS.md                    # 任务模板（host 侧动态填充）
-├── entrypoint.py                      # 容器入口，加载 skill，启动 agent
-├── Dockerfile                         # 基于 OpenHands 官方镜像
+├── entrypoint.py                      # 容器入口（host 侧常只读挂载进 OpenHands 镜像）
 ├── .agents/skills/
 │   ├── kernel-designer/
 │   │   ├── SKILL.md

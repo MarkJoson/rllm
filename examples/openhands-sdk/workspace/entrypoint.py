@@ -145,6 +145,9 @@ agent_context = AgentContext(
     ),
 )
 
+# TODO(遗留): 暂不增设自定义 OpenHands Tool。若后续要收紧终端权限或压缩观测上下文，可评估
+# 结构化小工具（如固定调用 operator_pipeline、只返回 metrics 摘要等），与 Terminal/FileEditor 并存或替换策略需单独设计。
+
 agent = Agent(
     llm=llm,
     tools=[

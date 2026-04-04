@@ -10,6 +10,10 @@
 - **禁止手动 `conda activate`**——conda 操作由 `tools/` 脚本内部处理。
 - **禁止修改** `tools/` 目录。
 
+### 网络与依赖（软约束）
+
+本环境 **不提供可用的外网**（即使执行 `apt` / `pip install` / `curl` / `wget` 也会失败或不应依赖）。你必须 **只使用工作区内已有文件与 `tools/` 管线**，通过修改 `src/` 与运行 `bash tools/operator_pipeline.sh` 完成任务。**不要**尝试安装系统包、下载 wheel、或访问外部 URL 来「修复环境」；遇到缺依赖类错误，应调整算子实现或向 `metrics.json` / 脚本输出对齐排查，而不是联网。
+
 ## 工作流（Phase 0/1 已在 host 侧完成）
 
 | Phase | 内容 | 技能 | 迭代上限 |

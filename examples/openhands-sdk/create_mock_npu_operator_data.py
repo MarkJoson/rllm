@@ -12,6 +12,8 @@
 
 每行 extra_info 含 op_name / task_code / arch / instruction / scenario=npu_operator，
 rollout 侧据此布置 workspace 并计算 reward。
+
+完整字段说明见同目录 TRAINING_DATA.md。
 """
 
 from __future__ import annotations
