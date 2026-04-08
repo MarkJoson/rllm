@@ -50,7 +50,7 @@ def merge_workspace_skills(workspace_base: str, task_scope: Skill) -> list:
     skills: list = []
 
     if any((ws / name).exists() for name in ("AGENTS.md", "CLAUDE.md", "GEMINI.md")):
-        loaded = load_project_skills(workspace_dir=str(ws))
+        loaded = load_project_skills(work_dir=str(ws))
         if loaded:
             skills.extend(loaded if isinstance(loaded, list) else list(loaded))
 
