@@ -17,6 +17,7 @@ Prerequisites:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import logging
 import re
@@ -375,17 +376,22 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--task-timeout", type=int, default=300, help="KernelGYM per-task timeout (seconds)")
+    parser.add_argument(
+        "--max-concurrent-tasks",
+        type=int,
+        default=1,
+        help="Run this many tasks in parallel (each uses its own HTTP clients). "
+        "Match to vLLM capacity / KernelGYM worker count (e.g. 4). Default 1 = sequential.",
+    )
     parser.add_argument("--output", default="results.json", help="Output file path")
     args = parser.parse_args()
 
-    llm = OpenAI(base_url=args.vllm_url, api_key=args.vllm_api_key)
+    llm_probe = OpenAI(base_url=args.vllm_url, api_key=args.vllm_api_key)
     model_name = args.model
     if not model_name:
-        models = llm.models.list()
+        models = llm_probe.models.list()
         model_name = models.data[0].id if models.data else "default"
         log.info("Auto-detected model: %s", model_name)
-
-    gym = KernelGymClient(args.kernelgym_url, timeout=args.task_timeout + 120)
 
     try:
         health = httpx.get(f"{args.kernelgym_url}/health", timeout=10)
@@ -397,17 +403,32 @@ def main():
     if args.max_tasks:
         tasks = tasks[:args.max_tasks]
 
-    results: list[TaskResult] = []
-    for i, task in enumerate(tasks):
-        log.info("=== Task %d/%d: %s ===", i + 1, len(tasks), task.task_id)
-        tr = run_multi_turn(
-            task, llm, gym, model_name,
+    def _run_one_task(task: Task) -> TaskResult:
+        """Separate OpenAI + httpx clients per task (thread-safe for parallel runs)."""
+        llm_local = OpenAI(base_url=args.vllm_url, api_key=args.vllm_api_key)
+        gym_local = KernelGymClient(args.kernelgym_url, timeout=args.task_timeout + 120)
+        return run_multi_turn(
+            task,
+            llm_local,
+            gym_local,
+            model_name,
             max_turns=args.max_turns,
             temperature=args.temperature,
             max_tokens=args.max_tokens,
             task_timeout=args.task_timeout,
         )
-        results.append(tr)
+
+    results: list[TaskResult] = []
+    if args.max_concurrent_tasks <= 1:
+        for i, task in enumerate(tasks):
+            log.info("=== Task %d/%d: %s ===", i + 1, len(tasks), task.task_id)
+            results.append(_run_one_task(task))
+    else:
+        w = min(args.max_concurrent_tasks, len(tasks))
+        log.info("Running %d tasks with up to %d workers in parallel", len(tasks), w)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=w) as pool:
+            # map preserves task order in results
+            results = list(pool.map(_run_one_task, tasks))
 
     # Aggregate metrics
     total = len(results)
@@ -419,6 +440,7 @@ def main():
     summary = {
         "model": model_name,
         "max_turns": args.max_turns,
+        "max_concurrent_tasks": args.max_concurrent_tasks,
         "total_tasks": total,
         "correct_any_turn": correct_any,
         "correct_rate": f"{correct_any / total:.1%}" if total else "N/A",
