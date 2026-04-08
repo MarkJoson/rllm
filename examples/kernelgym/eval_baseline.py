@@ -158,60 +158,83 @@ class Task:
     prompt: str = ""
 
 
-def load_tasks(data_path: str) -> list[Task]:
-    """Load tasks from parquet, jsonl, or HuggingFace dataset id."""
+def _parse_row(row: dict, idx: int) -> Task | None:
+    """Parse a single data row into a Task, auto-detecting the format.
+
+    Supported formats:
+      A) KernelBench raw:  code, name, level, problem_id
+      B) rllm JSONL:       reference_code, problem_id, entry_point, description
+      C) DR.Kernel parquet: prompt, extra_info.{ground_truth, entry_point, uuid}
+    """
+    # --- Format A: KernelBench raw (HuggingFace ScalingIntelligence/KernelBench) ---
+    if "code" in row and "name" in row:
+        level = row.get("level", "")
+        pid = row.get("problem_id", idx)
+        name = row.get("name", "")
+        tid = f"level{level}_{pid}_{name}" if level else f"task_{pid}"
+        desc = f"Optimise the PyTorch module '{name}' (Level {level}, Problem {pid})."
+        return Task(task_id=tid, reference_code=row["code"],
+                    entry_point="Model", prompt=desc)
+
+    # --- Format B: rllm JSONL (from prepare_kernelbench_data.py) ---
+    if "reference_code" in row:
+        tid = row.get("problem_id", f"task_{idx}")
+        entry = row.get("entry_point", "Model")
+        prompt = row.get("description", "")
+        return Task(task_id=str(tid), reference_code=row["reference_code"],
+                    entry_point=entry, prompt=prompt)
+
+    # --- Format C: DR.Kernel parquet (extra_info dict) ---
+    extra = row.get("extra_info", {}) or {}
+    if isinstance(extra, str):
+        extra = json.loads(extra)
+    ref_code = extra.get("ground_truth", extra.get("task_code", ""))
+    if not ref_code:
+        return None
+    entry = extra.get("entry_point", "Model")
+    tid = extra.get("uuid", extra.get("op_name", f"task_{idx}"))
+    prompt_raw = row.get("prompt", "")
+    if isinstance(prompt_raw, str) and prompt_raw.startswith("["):
+        msgs = json.loads(prompt_raw)
+        prompt_text = msgs[-1]["content"] if msgs else ""
+    else:
+        prompt_text = str(prompt_raw)
+    return Task(task_id=str(tid), reference_code=ref_code,
+                entry_point=entry, prompt=prompt_text)
+
+
+def load_tasks(data_path: str, hf_split: str = "level_1") -> list[Task]:
+    """Load tasks from parquet, jsonl, or HuggingFace dataset id.
+
+    Args:
+        data_path: Local file path (.parquet/.jsonl) or HuggingFace dataset id.
+        hf_split: Split name when loading from HuggingFace (default "level_1").
+                  KernelBench splits: level_1, level_2, level_3, level_4.
+    """
     tasks: list[Task] = []
 
     path = Path(data_path)
-    if path.suffix == ".parquet" or path.suffix == ".jsonl" or path.exists():
+    if path.suffix in (".parquet", ".jsonl") or path.exists():
         import pandas as pd
-        if path.suffix == ".parquet":
-            df = pd.read_parquet(data_path)
-        elif path.suffix == ".jsonl":
+        if path.suffix == ".jsonl":
             df = pd.read_json(data_path, lines=True)
         else:
             df = pd.read_parquet(data_path)
 
         for idx, row in df.iterrows():
-            extra = row.get("extra_info", {}) or {}
-            if isinstance(extra, str):
-                extra = json.loads(extra)
-            prompt_raw = row.get("prompt", "")
-            if isinstance(prompt_raw, str) and prompt_raw.startswith("["):
-                msgs = json.loads(prompt_raw)
-                prompt_text = msgs[-1]["content"] if msgs else ""
-            else:
-                prompt_text = str(prompt_raw)
-
-            ref_code = extra.get("ground_truth", extra.get("task_code", ""))
-            entry = extra.get("entry_point", "Model")
-            tid = extra.get("uuid", extra.get("op_name", f"task_{idx}"))
-
-            if ref_code:
-                tasks.append(Task(task_id=str(tid), reference_code=ref_code,
-                                  entry_point=entry, prompt=prompt_text))
+            t = _parse_row(row.to_dict(), idx)
+            if t:
+                tasks.append(t)
     else:
         try:
             from datasets import load_dataset
-            ds = load_dataset(data_path, split="train")
+            ds = load_dataset(data_path, split=hf_split)
             for idx, row in enumerate(ds):
-                extra = row.get("extra_info", {}) or {}
-                if isinstance(extra, str):
-                    extra = json.loads(extra)
-                prompt_raw = row.get("prompt", "")
-                if isinstance(prompt_raw, str) and prompt_raw.startswith("["):
-                    msgs = json.loads(prompt_raw)
-                    prompt_text = msgs[-1]["content"] if msgs else ""
-                else:
-                    prompt_text = str(prompt_raw)
-                ref_code = extra.get("ground_truth", extra.get("task_code", ""))
-                entry = extra.get("entry_point", "Model")
-                tid = extra.get("uuid", f"task_{idx}")
-                if ref_code:
-                    tasks.append(Task(task_id=str(tid), reference_code=ref_code,
-                                      entry_point=entry, prompt=prompt_text))
+                t = _parse_row(dict(row), idx)
+                if t:
+                    tasks.append(t)
         except Exception as e:
-            log.error("Cannot load data from %s: %s", data_path, e)
+            log.error("Cannot load data from %s (split=%s): %s", data_path, hf_split, e)
             sys.exit(1)
 
     log.info("Loaded %d tasks from %s", len(tasks), data_path)
@@ -346,6 +369,7 @@ def main():
     parser.add_argument("--model", default=None, help="Model name for vLLM (auto-detect if not set)")
     parser.add_argument("--kernelgym-url", default="http://localhost:10907", help="KernelGYM server URL")
     parser.add_argument("--data", required=True, help="Path to parquet/jsonl or HuggingFace dataset id")
+    parser.add_argument("--hf-split", default="level_1", help="HuggingFace dataset split (e.g. level_1, level_2, level_3)")
     parser.add_argument("--max-turns", type=int, default=3, help="Max turns per task")
     parser.add_argument("--max-tasks", type=int, default=None, help="Limit number of tasks (for quick test)")
     parser.add_argument("--temperature", type=float, default=0.6)
@@ -369,7 +393,7 @@ def main():
     except Exception as e:
         log.warning("KernelGYM health check failed: %s (continuing anyway)", e)
 
-    tasks = load_tasks(args.data)
+    tasks = load_tasks(args.data, hf_split=args.hf_split)
     if args.max_tasks:
         tasks = tasks[:args.max_tasks]
 
