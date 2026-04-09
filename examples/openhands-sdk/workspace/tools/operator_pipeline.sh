@@ -35,28 +35,7 @@ TASK_FILE="${ROOT}/src/${OP_NAME}.py"
 VERIFY_DIR="${ROOT}/src"
 
 # ---------------------------------------------------------------------------
-# 检查文件
-# ---------------------------------------------------------------------------
-if [[ ! -f "${IMPL_FILE}" ]]; then
-  echo "[pipeline] implementation not found: ${IMPL_FILE}" >&2
-  write_metrics false false false "" "" "" "implementation file missing"
-  exit 1
-fi
-
-if [[ ! -f "${TASK_FILE}" ]]; then
-  TASK_FILE_ALT="${ROOT}/${OP_NAME}.py"
-  if [[ -f "${TASK_FILE_ALT}" ]]; then
-    cp "${TASK_FILE_ALT}" "${ROOT}/src/${OP_NAME}.py"
-    TASK_FILE="${ROOT}/src/${OP_NAME}.py"
-  else
-    echo "[pipeline] task file not found: ${TASK_FILE}" >&2
-    write_metrics false false false "" "" "" "task file missing"
-    exit 1
-  fi
-fi
-
-# ---------------------------------------------------------------------------
-# 辅助：写 metrics
+# 辅助：写 metrics（必须在文件检查之前定义）
 # ---------------------------------------------------------------------------
 write_metrics() {
   local ast_ok="$1" corr_ok="$2" success="$3"
@@ -95,6 +74,27 @@ EOJSON
 }
 EOJSON2
 }
+
+# ---------------------------------------------------------------------------
+# 检查文件
+# ---------------------------------------------------------------------------
+if [[ ! -f "${IMPL_FILE}" ]]; then
+  echo "[pipeline] implementation not found: ${IMPL_FILE}" >&2
+  write_metrics false false false "" "" "" "implementation file missing"
+  exit 1
+fi
+
+if [[ ! -f "${TASK_FILE}" ]]; then
+  TASK_FILE_ALT="${ROOT}/${OP_NAME}.py"
+  if [[ -f "${TASK_FILE_ALT}" ]]; then
+    cp "${TASK_FILE_ALT}" "${ROOT}/src/${OP_NAME}.py"
+    TASK_FILE="${ROOT}/src/${OP_NAME}.py"
+  else
+    echo "[pipeline] task file not found: ${TASK_FILE}" >&2
+    write_metrics false false false "" "" "" "task file missing"
+    exit 1
+  fi
+fi
 
 # ---------------------------------------------------------------------------
 # Step 1: AST 退化检查（venv Python，不需要 NPU）
