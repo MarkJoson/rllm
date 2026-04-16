@@ -8,6 +8,20 @@
 #   调试：如 ASCEND_LAUNCH_BLOCKING 等。
 # 上述变量须在 OPERATOR_PYTHON 跑 verify.py / benchmark.py 之前生效（本文件由 operator_pipeline.sh 最先 source）。
 
+rm -rf /root/.triton/cache/
+ 
+source /opt/conda/envs/evaluator-py311/Ascend/cann-8.5.0/set_env.sh
+source /opt/conda/envs/evaluator-py311/Ascend/ascend-toolkit/set_env.sh
+
+export TRITON_DEBUG=1
+export TRITON_ALLWAYS_COMPILE=1
+export TRITON_DISABLE_LINE_INFO=0
+
+export PATH=/opt/conda/envs/evaluator-py311/Ascend/cann-8.5.0/tools/bishengir/bin:$PATH
+
+export TRITON_INTERPRET=0
+
+
 # --- Conda ---
 : "${CONDA_BASE:=/opt/conda}"
 : "${OPERATOR_CONDA_ENV:=operator-build}"

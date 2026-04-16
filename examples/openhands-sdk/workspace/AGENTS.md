@@ -122,7 +122,7 @@ bash tools/operator_pipeline.sh --op_name <op_name>
 ## 文件布局
 
 ```
-/opt/workspace/
+.
 ├── INSTRUCTIONS.md
 ├── src/
 │   ├── {op_name}.py                       # 任务文件（host 写入）
